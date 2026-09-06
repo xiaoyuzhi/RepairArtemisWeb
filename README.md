@@ -6,7 +6,8 @@
 当海康 iSecure VMS（综合安防管理平台）的 OpenAPI 组件 `artemis-web`（端口 9017）与 `artemis-portal`（端口 9018）服务**未运行、启动失败或未安装**时，本工具可一键诊断并自动修复，是运维人员的"服务急救包"。
 
 - 开发人：余志强　QQ: 379008610　主页：https://github.com/xiaoyuzhi
-- 版权：Copyright (c) 2026 余志强 (Yu Zhiqiang). All rights reserved.
+- 版权：Copyright (c) 2026 余志强 (Yu Zhiqiang)
+- 许可：本项目基于 [MIT License](LICENSE) 开源
 
 ---
 
@@ -117,6 +118,12 @@ rem 产物: cpp\RepairArtemisWeb.exe  (单文件, 免运行库)
 
 - GitHub：https://github.com/xiaoyuzhi/RepairArtemisWeb
 - Gitee：https://gitee.com/lovemun/repair-artemis-web
+
+## 许可证 (License)
+
+本项目采用 **MIT License** 开源，完整条款见 [LICENSE](LICENSE) 文件。
+
+MIT 是一种宽松许可证：允许任何人自由使用、复制、修改、合并、发布、分发、再许可及销售本软件的副本，仅需在所有副本或实质性部分中保留版权声明与本许可声明。软件按"原样"提供，不附带任何明示或默示的担保（包括但不限于适销性、特定用途适用性及非侵权性），作者在任何情况下均不对因使用本软件而产生的索赔、损害或其他责任负责。
 
 ## 免责声明
 
