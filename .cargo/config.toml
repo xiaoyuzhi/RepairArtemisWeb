@@ -1,0 +1,3 @@
+# 静态链接 MSVC CRT (VCRUNTIME140.dll), 使 RepairArtemisWeb.exe 单文件免依赖运行库
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

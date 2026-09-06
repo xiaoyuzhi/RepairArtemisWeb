@@ -1,0 +1,18 @@
+# ---- Rust 构建产物 ----
+/target/
+
+# ---- C++ 构建产物 ----
+cpp/*.exe
+cpp/*.o
+cpp/*.obj
+
+# ---- 发布用二进制 (保留源码即可) ----
+*.exe
+
+# ---- IDE / 本地数据 ----
+.codebuddy/
+
+# ---- 系统临时文件 ----
+*.tmp
+Thumbs.db
+Desktop.ini

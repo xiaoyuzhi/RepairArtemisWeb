@@ -1,0 +1,14 @@
+[package]
+name = "repair-artemis-web"
+version = "0.1.0"
+edition = "2021"
+description = "iSecure VMS OpenAPI artemis-web / artemis-portal 服务修复工具 (零依赖 CLI)"
+
+[[bin]]
+name = "RepairArtemisWeb"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
