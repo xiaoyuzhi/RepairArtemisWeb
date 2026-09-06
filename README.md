@@ -13,8 +13,6 @@
 
 ## 功能
 
-复刻自 `Repair-ArtemisWeb.ps1`，独立打包为 exe：
-
 1. **定位** OpenAPI 安装目录与内置 `node.exe`（默认标准路径 `C:\Program Files (x86)\iSecure VMS\VSM Servers\OpenAPI\artemis`，可用 `--root` 覆盖）；
 2. **检查前置组件**：artemis 网关(9016) / redis / postgresql / minio / nginx 是否就绪；
 3. **逐个修复** `artemis-web` / `artemis-portal`：
