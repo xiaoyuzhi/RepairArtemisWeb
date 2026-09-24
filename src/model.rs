@@ -222,6 +222,8 @@ pub enum L3 {
     Ok(u16),
     /// 拿到了响应但不符合期望 (含 404: 说明没被转发而是当静态文件)
     Bad(u16),
+    /// 探针原始输出, 待 probe::classify_l3 归类
+    Raw(u16),
     /// TLS 层不可用, 端到端无法验证 (Win7 仅 TLS1.0 / 握手失败)
     TlsUnavailable,
     /// 443 端口不可达
@@ -269,6 +271,10 @@ pub fn attribute(l1: L1, l2: Option<L2>, l3: Option<L3>) -> RouteVerdict {
         }
         (Some(L2::Ok(_)), Some(L3::Bad(_))) | (Some(L2::Ok(_)), Some(L3::NginxDown)) => {
             v!("后端健康, nginx 转发层故障", VerdictAction::NginxAttrib, 3)
+        }
+        // 防御: 调用方漏归类时不得把 Raw 当成正常, 也不能当成 nginx 故障
+        (Some(L2::Ok(_)), Some(L3::Raw(_))) => {
+            v!("端到端结果未经归类", VerdictAction::Unverifiable, 0)
         }
         (Some(L2::Ok(_)), Some(L3::TlsUnavailable)) => {
             v!("端到端无法验证 (TLS 层不可用)", VerdictAction::Unverifiable, 0)
