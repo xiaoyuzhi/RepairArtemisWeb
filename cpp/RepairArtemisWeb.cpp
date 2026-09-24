@@ -684,6 +684,46 @@ static bool parse_status_line(const std::string& line, unsigned short& out) {
     return true;
 }
 
+// ----------------------------------------------------------------------------
+// 日志尾部读取与故障特征归因 (与 Rust logs::tail_file / classify_log 对齐)
+// ----------------------------------------------------------------------------
+static const unsigned long long TAIL_LIMIT_BYTES = 64ull * 1024;
+
+// 定位到尾部窗口后顺序读取, 避免整文件进内存。成功返回 true 并写入 out。
+static bool tail_file(const fs::path& p, unsigned long long max, std::string& out) {
+    out.clear();
+    std::ifstream f(p, std::ios::binary | std::ios::ate);
+    if (!f) return false;
+    std::streamoff len = f.tellg();
+    if (len < 0) return false;
+    unsigned long long ulen = (unsigned long long)len;
+    unsigned long long want = ulen < max ? ulen : max;
+    if (want == 0) return true;
+    f.seekg((std::streamoff)(ulen - want), std::ios::beg);
+    out.resize((size_t)want);
+    f.read(&out[0], (std::streamsize)want);
+    std::streamsize got = f.gcount();
+    out.resize(got > 0 ? (size_t)got : 0);
+    return true;
+}
+
+// spec §8 特征表。顺序即优先级, 与 Rust SIGS 逐条一致; 未命中返回 nullptr。
+static const char* classify_log(const std::string& text) {
+    struct Sig { const char* k; const char* v; };
+    static const Sig SIGS[] = {
+        { "ECONNREFUSED",           "上游依赖拒绝连接" },
+        { "Connection refused",     "上游依赖拒绝连接" },
+        { "EADDRINUSE",             "端口冲突" },
+        { "address already in use", "端口冲突" },
+        { "OutOfMemoryError",       "JVM 堆不足" },
+        { "heap size",              "JVM 堆不足" },
+        { "ECONNRESET",             "与网关或数据库的连接被重置" },
+    };
+    for (const Sig& s : SIGS)
+        if (text.find(s.k) != std::string::npos) return s.v;
+    return nullptr;
+}
+
 static CompConfig read_config(const fs::path& dir) {
     CompConfig cfg;
     std::ifstream f(dir / L"config.properties", std::ios::binary);
