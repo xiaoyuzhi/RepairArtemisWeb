@@ -1,17 +1,19 @@
 // ============================================================================
 // RepairArtemisWeb (C++ 版)
-//   iSecure VMS OpenAPI artemis-web / artemis-portal 组件修复工具
+//   iSecure VMS OpenAPI 组件修复与三层归因诊断工具 (C++ 版)
 //
 //   功能与 Rust 版 RepairArtemisWeb 完全一致:
 //     * 定位 OpenAPI 安装目录与内置 node.exe;
-//     * 检查前置组件 (artemis 网关 9016 / redis 7019 / postgresql 5432 /
-//       minio 9000 / nginx 443);
-//     * 对 artemis-web / artemis-portal 逐个修复:
-//         - 服务运行中            -> 跳过 (除非 --reinstall);
-//         - 服务停止              -> 直接启动, 端口起来即完成;
-//         - 未安装/启动失败/端口未起 -> 卸载(service.uninstall.js)
-//                                   -> 重装(service.install.js) -> 启动;
-//     * 等待端口监听 + HTTP 健康检查, 输出汇总。
+//     * 检查前置组件 (redis 7019 / postgresql 5432 / minio 9000 / nginx 443);
+//     * 对 artemis(Java 网关 9016) / artemis-web(9017) / artemis-portal(9018)
+//       逐条做三层探针 (L1 端口 / L2 直连状态码 / L3 经本机 nginx 443),
+//       按归因矩阵给出结论, 再按组件类型执行修复阶梯:
+//         - node 服务   : 卸载(service.uninstall.js) -> 重装(service.install.js) -> 启动;
+//         - prunsrv 网关: 默认只 restart, 卸载重装需 --reinstall 且交互确认;
+//     * nginx 配置只读归因 (不修改、不 reload), 识别 $artemis 回环配置;
+//     * 修复失败时 tail 该组件类型的日志并按特征给出结论;
+//     * 输出路由归因表, 退出码区分后端异常(1) 与 nginx 转发层故障(3)。
+//     L3 经系统内置 System32\curl.exe 取状态码 (绝对路径, 不经 shell)。
 //
 //   特性: 零第三方依赖(仅 Win32 API), 静态链接单 exe;
 //         带参数运行 = 命令行模式, 不带参数 = 中文交互式菜单;
@@ -32,9 +34,11 @@
 #include <shellapi.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdarg>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -273,6 +277,19 @@ struct RouteVerdict {
     VerdictAction action;
     unsigned char exit_contrib;  // 0/1/3
 };
+
+// 归因表只给结论, 这里给"下一步做什么"; 正常态为空串。
+static const char* next_step(VerdictAction a) {
+    switch (a) {
+        case VerdictAction::None_:          return "";
+        case VerdictAction::RepairBackend:  return "标准修复会按该组件类型的阶梯自动处理";
+        case VerdictAction::ReportOccupier: return "查占用端口的进程, 不要重复起服务";
+        case VerdictAction::ShowLog:        return "看该组件日志 (工具已在失败时输出尾部与特征归因)";
+        case VerdictAction::NginxAttrib:    return "改 nginx 配置, 不要重启后端";
+        case VerdictAction::Unverifiable:   return "确认 System32\\curl.exe 存在, 或用 --e2e-host 指定地址";
+    }
+    return "";
+}
 
 // 首次匹配, 顺序即优先级 (与 Rust 的 match 臂顺序逐条对应)。
 // Rust 的 Option<L2>/Option<L3> 在此用 has2/has3 表达。
@@ -714,6 +731,9 @@ static L2 http_probe_against(unsigned short port, const std::string& pathname,
     a.sin_family = AF_INET;
     a.sin_port = htons(port);
     inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+    if (connect(s, (sockaddr*)&a, sizeof a) == SOCKET_ERROR) {
+        closesocket(s); return fail;
+    }
     std::string path = pathname.empty() ? "/" : pathname;
     char req[512];
     snprintf(req, sizeof req,
@@ -838,6 +858,16 @@ static SvcState service_state(const std::wstring& name) {
         }
     }
     return SvcState::Other;
+}
+
+// 与 Rust 的 {:?} 输出对齐
+static const char* svc_state_name(SvcState s) {
+    switch (s) {
+        case SvcState::Missing: return "Missing";
+        case SvcState::Stopped: return "Stopped";
+        case SvcState::Running: return "Running";
+        default:                return "Other";
+    }
 }
 
 static void start_service(const std::wstring& name) {
@@ -1079,10 +1109,9 @@ static std::vector<Upstream> parse_upstreams(const std::string& text) {
         ++i;
         if (!starts_with(t, "upstream")) continue;
         std::string rest = t.substr(8);
-        if (!rest.empty()) {
-            char f = ltrim(rest).empty() ? ' ' : ltrim(rest)[0];
-            if (std::isalnum((unsigned char)f)) continue;
-        }
+        // 判据是 "upstream" 后面紧邻的那个字符 (Rust: rest.chars().next()), 不是去空格后的
+        // 名字首字母 —— 后者恒为字母, 会把每一个真实 upstream 都跳掉。
+        if (!rest.empty() && std::isalnum((unsigned char)rest[0])) continue;
         rest = ltrim(rest);
         std::string name;
         for (char c : rest) {
@@ -1445,8 +1474,9 @@ static int repair_component(const ResolvedComponent& rc, const fs::path& node_ex
 
     SvcState state = service_state(rc.svc_name);
     bool l1 = port_listening(rc.port);
-    logf(Level::Info, "服务名=%s 端口=%u 状态=%d L1=%d",
-         decode_to_utf8(rc.svc_name).c_str(), rc.port, (int)state, l1 ? 1 : 0);
+    logf(Level::Info, "服务名=%s 端口=%u 状态=%s L1=%s",
+         decode_to_utf8(rc.svc_name).c_str(), rc.port, svc_state_name(state),
+         l1 ? "true" : "false");
 
     L2 noresp; noresp.kind = L2Kind::NoHttpResponse; noresp.code = 0;
     L3 nol3;   nol3.kind = L3Kind::TlsUnavailable;   nol3.code = 0;
@@ -1520,11 +1550,13 @@ static int repair_component(const ResolvedComponent& rc, const fs::path& node_ex
     L2 l2 = http_probe_against(rc.port, ws2utf8(rc.pathname), rc.def->l2_ok);
     RouteVerdict v = attribute(L1::Listening, true, l2, false, nol3);
     log(v.exit_contrib == 0 ? Level::Ok : Level::Warn,
+        // 这里只覆盖 L1+L2, 不写"修复成功": 端到端 (L3) 在下面的归因表里才判定 (spec §13.3)
         std::string("[") + rc.def->key + "] 端口 " + std::to_string(rc.port)
-        + " 已监听; " + v.cause);
+        + " 已监听, 直连结论: " + v.cause + " (端到端见路由归因表)");
     issues += v.exit_contrib;
     return v.exit_contrib;
 }
+
 // ----------------------------------------------------------------------------
 // 主流程 (与 Rust main::Options / parse_args / render_route_table / run_flow 对齐)
 // ----------------------------------------------------------------------------
@@ -1627,6 +1659,16 @@ struct RouteRow {
     L3 l3;
 };
 
+// 按 UTF-8 码点数补齐 (C 的 %-Ns 按字节补, 中文标签会与 Rust 的 {:<N} 差出若干空格)
+static std::string pad_right(const std::string& s, size_t width) {
+    size_t chars = 0;
+    for (size_t i = 0; i < s.size(); ++i)
+        if ((s[i] & 0xC0) != 0x80) ++chars;
+    std::string r = s;
+    for (; chars < width; ++chars) r += ' ';
+    return r;
+}
+
 // spec §9 报告表。每行: 路由 / 目标端口 / L1 / L2 / L3 / 结论。
 static std::string render_route_table(const std::vector<RouteRow>& rows) {
     std::string s =
@@ -1634,7 +1676,7 @@ static std::string render_route_table(const std::vector<RouteRow>& rows) {
     for (const RouteRow& r : rows) {
         RouteVerdict v = attribute(r.l1, r.has2, r.l2, r.has3, r.l3);
         const char* l1s = (r.l1 == L1::Listening) ? "监听" : "未监听";
-        char l2s[40], l3s[40], line[512];
+        char l2s[40], l3s[40];
         if (!r.has2) std::snprintf(l2s, sizeof l2s, "-");
         else switch (r.l2.kind) {
             case L2Kind::Ok:            std::snprintf(l2s, sizeof l2s, "%u", r.l2.code); break;
@@ -1645,15 +1687,15 @@ static std::string render_route_table(const std::vector<RouteRow>& rows) {
         if (!r.has3) std::snprintf(l3s, sizeof l3s, "-");
         else switch (r.l3.kind) {
             case L3Kind::Ok:            std::snprintf(l3s, sizeof l3s, "%u", r.l3.code); break;
-            case L3Kind::Bad:
-            case L3Kind::Raw_:          std::snprintf(l3s, sizeof l3s, "%u!", r.l3.code); break;
+            case L3Kind::Bad:           std::snprintf(l3s, sizeof l3s, "%u!", r.l3.code); break;
+            case L3Kind::Raw_:          std::snprintf(l3s, sizeof l3s, "%u?", r.l3.code); break;
             case L3Kind::TlsUnavailable:std::snprintf(l3s, sizeof l3s, "TLS不可用"); break;
             case L3Kind::NginxDown:     std::snprintf(l3s, sizeof l3s, "443不可达"); break;
             case L3Kind::Skipped:       std::snprintf(l3s, sizeof l3s, "-"); break;
         }
-        std::snprintf(line, sizeof line, "%-16s  %-7s  %-7s  %-11s  %-11s  %s\n",
-                      r.path.c_str(), r.target.c_str(), l1s, l2s, l3s, v.cause);
-        s += line;
+        s += pad_right(r.path, 16) + "  " + pad_right(r.target, 7) + "  "
+           + pad_right(l1s, 7) + "  " + pad_right(l2s, 11) + "  "
+           + pad_right(l3s, 11) + "  " + v.cause + "\n";
     }
     return s;
 }
@@ -1723,16 +1765,21 @@ static int run_flow(const Options& opts) {
     else if (!locate_nginx_conf(fs::path(SEARCH_BASE), nginx_root)) nginx_root.clear();
 
     if (!nginx_root.empty()) {
-        logf(Level::Ok, "nginx 根目录: %s", decode_to_utf8(nginx_root.native()).c_str());
         NginxInfo info = load_nginx_info(nginx_root);
+        logf(Level::Ok, "nginx 根目录: %s", decode_to_utf8(info.root.native()).c_str());
         // 只报 /artemis* 相关路由: 全量 proxy_pass 有上百条动态路由, 会淹没归因结论
         size_t artemis_n = 0;
         for (const Route& r : info.routes) {
             if (r.path.compare(0, 8, "/artemis") != 0) continue;
             ++artemis_n;
             std::string tgt;
-            if (r.target == RouteTargetKind::Upstream_) tgt = "upstream " + r.upstream;
-            else if (r.target == RouteTargetKind::Dynamic) tgt = "动态路由 (静态不可判定)";
+            if (r.target == RouteTargetKind::Upstream_) {
+                // 端口是归因的关键: 回环时这里会显示 443 而不是后端端口
+                unsigned short rp = 0;
+                tgt = resolve_route_port(info, r.path, rp)
+                          ? "upstream " + r.upstream + ":" + std::to_string(rp)
+                          : "upstream " + r.upstream + " (未定义)";
+            } else if (r.target == RouteTargetKind::Dynamic) tgt = "动态路由 (静态不可判定)";
             else tgt = "无 proxy_pass";
             logf(Level::Info, "  location %s -> %s", r.path.c_str(), tgt.c_str());
         }
@@ -1797,10 +1844,34 @@ static int run_flow(const Options& opts) {
         log(Level::Step, "==== 路由归因表 ====");
         std::string table = render_route_table(rows);
         for (const std::string& line : split_lines(table)) log(Level::Info, line);
+        // 归因表只给结论, 下面逐条给下一步; 端口在听但没 HTTP 响应时把占用者 PID 一起报出来
+        for (const RouteRow& r : rows) {
+            RouteVerdict v = attribute(r.l1, r.has2, r.l2, r.has3, r.l3);
+            if (v.exit_contrib == 0) continue;
+            const char* hint = next_step(v.action);
+            if (r.has2 && r.l2.kind == L2Kind::NoHttpResponse) {
+                unsigned short port = (unsigned short)std::strtoul(r.target.c_str(), nullptr, 10);
+                unsigned long pid = 0;
+                if (port_owner_pid(port, pid)) {
+                    logf(Level::Warn, "%s: 占用进程 PID=%lu%s%s",
+                         r.path.c_str(), pid, hint[0] ? " | " : "", hint);
+                    continue;
+                }
+            }
+            if (hint[0]) logf(Level::Warn, "%s: %s", r.path.c_str(), hint);
+        }
     }
 
     // == 7. 汇总 ==
     log(Level::Step, "==== 汇总 ====");
+    // spec §13.3: 只有 L1+L2+L3 全部通过才说"修复成功"
+    bool all_pass = !rows.empty();
+    for (const RouteRow& r : rows) {
+        if (attribute(r.l1, r.has2, r.l2, r.has3, r.l3).exit_contrib != 0) all_pass = false;
+    }
+    if (!check_only && all_pass) {
+        log(Level::Ok, "修复成功: 全部路由的 L1/L2/L3 三层均通过。");
+    }
     if (check_only) {
         logf(Level::Info, "诊断完成 (未做任何修改)。异常项: %u", issues);
     } else {
@@ -1889,7 +1960,7 @@ int wmain(int argc, wchar_t** argv) {
     bool admin = is_admin();
     if (args.empty()) {
         log(Level::Step,
-            "==== iSecure VMS OpenAPI artemis-web/portal 修复工具 ====");
+            "==== iSecure VMS OpenAPI 组件修复与归因诊断工具 ====");
         int sel = choose_action_interactive(admin);
         if (sel < 0) {  // 菜单选择"0 退出"
             pause_if_console();
@@ -1902,7 +1973,7 @@ int wmain(int argc, wchar_t** argv) {
         std::wstring err;
         bool want_help = false;
         if (!parse_args(args, opts, err, want_help)) {
-            logf(Level::Err, "错误: %s", decode_to_utf8(err).c_str());
+            std::fprintf(stderr, "错误: %s\n", decode_to_utf8(err).c_str());
             usage();
             return 2;
         }

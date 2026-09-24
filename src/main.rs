@@ -1,16 +1,18 @@
 // ============================================================================
 // RepairArtemisWeb
-//   iSecure VMS OpenAPI artemis-web / artemis-portal 组件修复工具
+//   iSecure VMS OpenAPI 组件修复与三层归因诊断工具
+//   (基础流程复刻自 Repair-ArtemisWeb.ps1, 探针与归因为 0.2.0 新增)
 //
-//   功能复刻自 Repair-ArtemisWeb.ps1:
-//     * 定位 OpenAPI 安装目录与内置 node.exe;
-//     * 检查前置组件 (artemis 网关 9016 / redis / postgresql / minio / nginx);
-//     * 对 artemis-web / artemis-portal 逐个修复:
-//         - 服务运行中            -> 跳过 (除非 --reinstall);
-//         - 服务停止              -> 直接启动, 端口起来即完成;
-//         - 未安装/启动失败/端口未起 -> 卸载(service.uninstall.js)
-//                                     -> 重装(service.install.js) -> 启动;
-//     * 等待端口监听 + HTTP 健康检查, 输出汇总。
+//   * 定位 OpenAPI 安装目录与内置 node.exe;
+//   * 检查前置组件 (redis / postgresql / minio / nginx);
+//   * 对 artemis(Java 网关 9016) / artemis-web(9017) / artemis-portal(9018)
+//     逐条做三层探针 (L1 端口 / L2 直连状态码 / L3 经本机 nginx 443),
+//     按归因矩阵给出结论, 再按组件类型执行修复阶梯:
+//       - node 服务   : 卸载 -> 重装 -> 启动 (原有流程);
+//       - prunsrv 网关: 默认只 restart, 卸载重装需 --reinstall 且交互确认;
+//   * nginx 配置只读归因 (不修改、不 reload), 识别 $artemis 回环配置;
+//   * 修复失败时 tail 该组件类型的日志并按特征给出结论;
+//   * 输出路由归因表, 退出码区分后端异常(1) 与 nginx 转发层故障(3)。
 //
 //   特性: 零第三方依赖 (纯 Rust 标准库 + 少量 Win32 FFI),
 //         带参数运行 = 命令行模式, 不带参数 = 中文交互式菜单。
@@ -20,15 +22,9 @@
 //   版权:   Copyright (c) 2026 余志强 (Yu Zhiqiang). All rights reserved.
 // ============================================================================
 
-// Task 6-9 才把这些模块接入生产路径; 在此之前允许尚未被消费的条目。
-// Task 10 收尾时必须移除该 allow 并确认无 dead_code 告警。
-#[allow(dead_code)]
 mod logs;
-#[allow(dead_code)]
 mod model;
-#[allow(dead_code)]
 mod nginx;
-#[allow(dead_code)]
 mod probe;
 
 use std::env;
@@ -613,7 +609,11 @@ fn repair_component(
     let verdict = model::attribute(model::L1::Listening, Some(l2), None);
     log(
         if verdict.exit_contrib == 0 { Level::Ok } else { Level::Warn },
-        &format!("[{}] 端口 {} 已监听; {}", rc.def.key, rc.port, verdict.cause),
+        // 这里只覆盖 L1+L2, 不写"修复成功": 端到端 (L3) 在下面的归因表里才判定 (spec §13.3)
+        &format!(
+            "[{}] 端口 {} 已监听, 直连结论: {} (端到端见路由归因表)",
+            rc.def.key, rc.port, verdict.cause
+        ),
     );
     *issues += verdict.exit_contrib as u32;
     verdict.exit_contrib
@@ -800,8 +800,8 @@ fn run_flow(opts: &Options) -> i32 {
     };
     match &nginx_root {
         Some(nr) => {
-            log(Level::Ok, &format!("nginx 根目录: {}", nr.display()));
             let info = nginx::load_nginx_info(nr);
+            log(Level::Ok, &format!("nginx 根目录: {}", info.root.display()));
             // 只报 /artemis* 相关路由: 全量 proxy_pass 有上百条动态路由, 会淹没归因结论
             let artemis_routes: Vec<&nginx::Route> = info
                 .routes
@@ -810,7 +810,11 @@ fn run_flow(opts: &Options) -> i32 {
                 .collect();
             for r in &artemis_routes {
                 let tgt = match &r.target {
-                    nginx::RouteTarget::Upstream(n) => format!("upstream {}", n),
+                    // 端口是归因的关键: 回环时这里会显示 443 而不是后端端口
+                    nginx::RouteTarget::Upstream(n) => match nginx::resolve_route_port(&info, &r.path) {
+                        Some(p) => format!("upstream {}:{}", n, p),
+                        None => format!("upstream {} (未定义)", n),
+                    },
                     nginx::RouteTarget::Dynamic => "动态路由 (静态不可判定)".into(),
                     nginx::RouteTarget::None => "无 proxy_pass".into(),
                 };
@@ -888,12 +892,41 @@ fn run_flow(opts: &Options) -> i32 {
             log(Level::Info, line);
         }
     }
-    for (_, _, l1, l2, l3) in &rows {
-        exit_max = exit_max.max(model::attribute(*l1, *l2, *l3).exit_contrib);
+    for (path, target, l1, l2, l3) in &rows {
+        let v = model::attribute(*l1, *l2, *l3);
+        exit_max = exit_max.max(v.exit_contrib);
+        if v.exit_contrib == 0 {
+            continue;
+        }
+        let hint = v.action.next_step();
+        // 端口在听但没 HTTP 响应: 把占用者 PID 一起报出来, 否则用户只能自己 netstat
+        let occupier = match l2 {
+            Some(model::L2::NoHttpResponse) => target
+                .parse::<u16>()
+                .ok()
+                .and_then(probe::port_owner_pid)
+                .map(|pid| format!("占用进程 PID={}", pid)),
+            _ => None,
+        };
+        let msg = match (&occupier, hint) {
+            (Some(p), h) if !h.is_empty() => format!("{}: {} | {}", path, p, h),
+            (Some(p), _) => format!("{}: {}", path, p),
+            (None, h) if !h.is_empty() => format!("{}: {}", path, h),
+            _ => continue,
+        };
+        log(Level::Warn, &msg);
     }
 
     // == 7. 汇总 ==
     log(Level::Step, "==== 汇总 ====");
+    // spec §13.3: 只有 L1+L2+L3 全部通过才说"修复成功"
+    let all_pass = !rows.is_empty()
+        && rows
+            .iter()
+            .all(|(_, _, l1, l2, l3)| model::attribute(*l1, *l2, *l3).exit_contrib == 0);
+    if !opts.check_only && all_pass {
+        log(Level::Ok, "修复成功: 全部路由的 L1/L2/L3 三层均通过。");
+    }
     if opts.check_only {
         log(Level::Info, &format!("诊断完成 (未做任何修改)。异常项: {}", issues));
     } else {

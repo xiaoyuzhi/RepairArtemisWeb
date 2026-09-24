@@ -242,6 +242,20 @@ pub enum VerdictAction {
     Unverifiable,
 }
 
+impl VerdictAction {
+    /// 报告表下方的"下一步"提示。归因不给动作就等于把判断推给用户。
+    pub fn next_step(&self) -> &'static str {
+        match self {
+            VerdictAction::None => "",
+            VerdictAction::RepairBackend => "标准修复会按该组件类型的阶梯自动处理",
+            VerdictAction::ReportOccupier => "查占用端口的进程, 不要重复起服务",
+            VerdictAction::ShowLog => "看该组件日志 (工具已在失败时输出尾部与特征归因)",
+            VerdictAction::NginxAttrib => "改 nginx 配置, 不要重启后端",
+            VerdictAction::Unverifiable => "确认 System32\\curl.exe 存在, 或用 --e2e-host 指定地址",
+        }
+    }
+}
+
 pub struct RouteVerdict {
     pub cause: &'static str,
     pub action: VerdictAction,
@@ -421,8 +435,7 @@ set _DisplayName=artemis
     }
 
     #[test]
-    fn 期望集合按组件区分() {
-        // spec §5: 网关额外接受 404, web/portal 不接受
+    fn 期望集合按组件区分() {        // spec §5: 网关额外接受 404, web/portal 不接受
         assert!(StatusSet::GATEWAY.accepts(404));
         assert!(!StatusSet::WEB.accepts(404));
         assert!(StatusSet::WEB.accepts(200));
@@ -474,5 +487,20 @@ set _DisplayName=artemis
             let v = attribute(L1::Listening, Some(L2::Ok(200)), Some(l3));
             assert_ne!(v.action, VerdictAction::RepairBackend, "L3={:?} 触发了后端修复", l3);
         }
+    }
+
+    #[test]
+    fn 每个异常归因都必须带下一步() {
+        use crate::model::VerdictAction::*;
+        // 正常态不该有提示
+        assert_eq!(None.next_step(), "");
+        // 每个动作都要给出可执行的下一步, 且 nginx 归因不得指向重启后端
+        assert!(!RepairBackend.next_step().is_empty());
+        assert!(!ReportOccupier.next_step().is_empty());
+        assert!(!ShowLog.next_step().is_empty());
+        assert!(!Unverifiable.next_step().is_empty());
+        let nginx = NginxAttrib.next_step();
+        assert!(nginx.contains("nginx"), "{}", nginx);
+        assert!(!nginx.contains("重启") || nginx.contains("不要重启"), "{}", nginx);
     }
 }

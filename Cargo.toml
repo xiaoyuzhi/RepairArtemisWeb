@@ -1,8 +1,8 @@
 [package]
 name = "repair-artemis-web"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "iSecure VMS OpenAPI artemis-web / artemis-portal 服务修复工具 (零依赖 CLI)"
+description = "iSecure VMS OpenAPI artemis/artemis-web/artemis-portal 组件修复与三层归因诊断工具 (零依赖 CLI)"
 
 [[bin]]
 name = "RepairArtemisWeb"
