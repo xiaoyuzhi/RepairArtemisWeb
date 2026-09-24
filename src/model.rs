@@ -62,8 +62,6 @@ impl StatusSet {
     }
 }
 
-// key / l2_ok 由 Task 8 的 repair_component 与 Task 9 的报告消费。
-#[allow(dead_code)]
 pub struct ComponentDef {
     pub key: &'static str,
     pub kind: Kind,
@@ -115,8 +113,6 @@ pub const COMPONENTS: &[ComponentDef] = &[
     },
 ];
 
-// def / dir 由 Task 8 的 repair_component 消费。
-#[allow(dead_code)]
 pub struct ResolvedComponent {
     pub def: &'static ComponentDef,
     pub dir: PathBuf,
@@ -199,6 +195,87 @@ pub fn resolve_component(def: &'static ComponentDef, root: &Path) -> ResolvedCom
 
     let present = dir.join(def.present_marker).is_file();
     ResolvedComponent { def, dir, svc_name, port, pathname, present, warnings }
+}
+
+// ---- 三层探针结果与归因矩阵 (spec §6) --------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum L1 {
+    Listening,
+    NotListening,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum L2 {
+    /// 状态码落在该组件期望集合
+    Ok(u16),
+    /// 5xx: 应用在跑但内部出错
+    ServerError(u16),
+    /// 有 HTTP 响应, 不在期望集合也非 5xx
+    Unexpected(u16),
+    /// TCP 连上却拿不到状态行 -> 多半是别的进程占了这个端口
+    NoHttpResponse,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum L3 {
+    Ok(u16),
+    /// 拿到了响应但不符合期望 (含 404: 说明没被转发而是当静态文件)
+    Bad(u16),
+    /// TLS 层不可用, 端到端无法验证 (Win7 仅 TLS1.0 / 握手失败)
+    TlsUnavailable,
+    /// 443 端口不可达
+    NginxDown,
+    /// --no-e2e
+    Skipped,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum VerdictAction {
+    None,
+    RepairBackend,
+    ReportOccupier,
+    ShowLog,
+    NginxAttrib,
+    Unverifiable,
+}
+
+pub struct RouteVerdict {
+    pub cause: &'static str,
+    pub action: VerdictAction,
+    /// 该路由对进程退出码的贡献 (0/1/3), 取多路由最大值
+    pub exit_contrib: u8,
+}
+
+/// spec §6 归因矩阵。自上而下首次匹配。纯函数: 探针结果由调用方注入。
+pub fn attribute(l1: L1, l2: Option<L2>, l3: Option<L3>) -> RouteVerdict {
+    macro_rules! v {
+        ($c:expr, $a:expr, $e:expr) => {
+            RouteVerdict { cause: $c, action: $a, exit_contrib: $e }
+        };
+    }
+    if l1 == L1::NotListening {
+        return v!("后端未监听端口", VerdictAction::RepairBackend, 1);
+    }
+    match (l2, l3) {
+        (Some(L2::NoHttpResponse), _) => {
+            v!("端口已被非 HTTP 进程占用", VerdictAction::ReportOccupier, 1)
+        }
+        (Some(L2::ServerError(_)), _) => {
+            v!("应用已启动但返回 5xx", VerdictAction::ShowLog, 1)
+        }
+        (Some(L2::Unexpected(_)), _) => {
+            v!("后端响应不符合期望状态码", VerdictAction::RepairBackend, 1)
+        }
+        (Some(L2::Ok(_)), Some(L3::Bad(_))) | (Some(L2::Ok(_)), Some(L3::NginxDown)) => {
+            v!("后端健康, nginx 转发层故障", VerdictAction::NginxAttrib, 3)
+        }
+        (Some(L2::Ok(_)), Some(L3::TlsUnavailable)) => {
+            v!("端到端无法验证 (TLS 层不可用)", VerdictAction::Unverifiable, 0)
+        }
+        (Some(L2::Ok(_)), _) => v!("正常", VerdictAction::None, 0),
+        (None, _) => v!("后端未响应, 探针未取到结果", VerdictAction::RepairBackend, 1),
+    }
 }
 
 #[cfg(test)]
@@ -347,5 +424,49 @@ set _DisplayName=artemis
         // 不设"非 5xx 即活": 403 对两者都是失败
         assert!(!StatusSet::GATEWAY.accepts(403));
         assert!(!StatusSet::GATEWAY.accepts(500));
+    }
+
+    // ---- Task 3: 归因矩阵 ----
+    // 注意: 不要 `use L2::*` 与 `use L3::*` 同时导入 —— 两者都有 `Ok` 变体会歧义;
+    // `VerdictAction::None` 也会遮蔽 `Option::None`。一律用全限定路径。
+    #[test]
+    fn 归因矩阵逐行匹配spec() {
+        use crate::model::{attribute, L1, L2, L3, VerdictAction as A};
+        let cases: Vec<(L1, Option<L2>, Option<L3>, A, u8)> = vec![
+            // 行1 正常
+            (L1::Listening, Some(L2::Ok(200)), Some(L3::Ok(200)), A::None, 0),
+            // 行2 后端未监听
+            (L1::NotListening, None, None, A::RepairBackend, 1),
+            // 行3 端口被非 HTTP 进程占用 (Review Focus #5)
+            (L1::Listening, Some(L2::NoHttpResponse), None, A::ReportOccupier, 1),
+            // 行4 5xx -> 出日志, 不重装
+            (L1::Listening, Some(L2::ServerError(500)), None, A::ShowLog, 1),
+            // 行5 后端健康但 nginx 转发层故障 -> 不得重启后端
+            (L1::Listening, Some(L2::Ok(200)), Some(L3::Bad(502)), A::NginxAttrib, 3),
+            // 行6 nginx 443 不可达
+            (L1::Listening, Some(L2::Ok(302)), Some(L3::NginxDown), A::NginxAttrib, 3),
+            // 行7 非期望状态码 -> 先修后端
+            (L1::Listening, Some(L2::Unexpected(404)), None, A::RepairBackend, 1),
+            // Review Focus #4: TLS 不可用不得判成后端或 nginx 故障
+            (L1::Listening, Some(L2::Ok(200)), Some(L3::TlsUnavailable), A::Unverifiable, 0),
+            // --no-e2e 时 L3 为 Skipped, 等价于未评估
+            (L1::Listening, Some(L2::Ok(200)), Some(L3::Skipped), A::None, 0),
+        ];
+        for (l1, l2, l3, want_action, want_exit) in cases {
+            let v = attribute(l1, l2, l3);
+            assert_eq!(v.action, want_action, "l1={:?} l2={:?} l3={:?}", l1, l2, l3);
+            assert_eq!(v.exit_contrib, want_exit);
+            assert!(!v.cause.is_empty());
+        }
+    }
+
+    #[test]
+    fn 后端健康时绝不因端到端失败而重启后端() {
+        // spec §6 核心不变式
+        use crate::model::{attribute, L1, L2, L3, VerdictAction};
+        for l3 in [L3::Bad(502), L3::Bad(404), L3::NginxDown, L3::TlsUnavailable, L3::Skipped] {
+            let v = attribute(L1::Listening, Some(L2::Ok(200)), Some(l3));
+            assert_ne!(v.action, VerdictAction::RepairBackend, "L3={:?} 触发了后端修复", l3);
+        }
     }
 }

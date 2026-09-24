@@ -20,9 +20,15 @@
 //   版权:   Copyright (c) 2026 余志强 (Yu Zhiqiang). All rights reserved.
 // ============================================================================
 
+// Task 6-9 才把这些模块接入生产路径; 在此之前允许尚未被消费的条目。
+// Task 10 收尾时必须移除该 allow 并确认无 dead_code 告警。
+#[allow(dead_code)]
 mod logs;
+#[allow(dead_code)]
 mod model;
+#[allow(dead_code)]
 mod nginx;
+#[allow(dead_code)]
 mod probe;
 
 use std::env;

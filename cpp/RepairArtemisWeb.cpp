@@ -893,6 +893,57 @@ static ResolvedComponent resolve_component(const ComponentDef& def, const fs::pa
 }
 
 // ----------------------------------------------------------------------------
+// 三层探针结果与归因矩阵 (与 Rust model::L1/L2/L3/attribute 对齐, spec §6)
+// ----------------------------------------------------------------------------
+enum class L1 { Listening, NotListening };
+
+enum class L2Kind { Ok, ServerError, Unexpected, NoHttpResponse };
+struct L2 {
+    L2Kind kind;
+    unsigned short code;  // NoHttpResponse 时无意义
+};
+
+enum class L3Kind { Ok, Bad, TlsUnavailable, NginxDown, Skipped };
+struct L3 {
+    L3Kind kind;
+    unsigned short code;  // 仅 Ok/Bad 有意义
+};
+
+enum class VerdictAction { None_, RepairBackend, ReportOccupier, ShowLog, NginxAttrib, Unverifiable };
+
+struct RouteVerdict {
+    const char*   cause;
+    VerdictAction action;
+    unsigned char exit_contrib;  // 0/1/3
+};
+
+// 首次匹配, 顺序即优先级 (与 Rust 的 match 臂顺序逐条对应)。
+// Rust 的 Option<L2>/Option<L3> 在此用 has2/has3 表达。
+static RouteVerdict attribute(L1 l1, bool has2, L2 l2, bool has3, L3 l3) {
+    if (l1 == L1::NotListening)
+        return { "后端未监听端口", VerdictAction::RepairBackend, 1 };
+    // 行3 端口被非 HTTP 进程占用
+    if (has2 && l2.kind == L2Kind::NoHttpResponse)
+        return { "端口已被非 HTTP 进程占用", VerdictAction::ReportOccupier, 1 };
+    // 行4 5xx
+    if (has2 && l2.kind == L2Kind::ServerError)
+        return { "应用已启动但返回 5xx", VerdictAction::ShowLog, 1 };
+    // 行7 非期望状态码
+    if (has2 && l2.kind == L2Kind::Unexpected)
+        return { "后端响应不符合期望状态码", VerdictAction::RepairBackend, 1 };
+    // 行5/6 后端健康但转发层故障
+    if (has2 && l2.kind == L2Kind::Ok && has3
+        && (l3.kind == L3Kind::Bad || l3.kind == L3Kind::NginxDown))
+        return { "后端健康, nginx 转发层故障", VerdictAction::NginxAttrib, 3 };
+    // Review Focus #4: TLS 不可用不得判成后端或 nginx 故障
+    if (has2 && l2.kind == L2Kind::Ok && has3 && l3.kind == L3Kind::TlsUnavailable)
+        return { "端到端无法验证 (TLS 层不可用)", VerdictAction::Unverifiable, 0 };
+    if (has2 && l2.kind == L2Kind::Ok)
+        return { "正常", VerdictAction::None_, 0 };
+    return { "后端未响应, 探针未取到结果", VerdictAction::RepairBackend, 1 };
+}
+
+// ----------------------------------------------------------------------------
 // 修复流程
 // ----------------------------------------------------------------------------
 static void print_wrapper_tail(const fs::path& comp_dir,

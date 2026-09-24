@@ -3,8 +3,6 @@
 // ============================================================================
 
 /// 从 HTTP 状态行取状态码。仅接受 `HTTP/1.x <3位数字>` 形态。
-// Task 6 的 probe::http_probe_against 起被生产路径调用。
-#[allow(dead_code)]
 pub fn parse_status_line(line: &str) -> Option<u16> {
     let rest = line.trim_start().strip_prefix("HTTP/")?;
     let (_ver, after) = rest.split_once(char::is_whitespace)?;
