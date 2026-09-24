@@ -627,18 +627,127 @@ enum Action {
     Reinstall,
 }
 
-fn run_flow(action: Action, root_arg: Option<String>) -> i32 {
+#[derive(Debug, PartialEq)]
+pub struct Options {
+    pub check_only: bool,
+    pub reinstall: bool,
+    pub root: Option<String>,
+    pub components: Vec<String>,
+    pub nginx_root: Option<String>,
+    pub e2e: bool,
+    pub e2e_host: String,
+    pub assume_yes: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            check_only: false,
+            reinstall: false,
+            root: None,
+            components: model::COMPONENTS.iter().map(|c| c.key.to_string()).collect(),
+            nginx_root: None,
+            e2e: true,
+            e2e_host: "127.0.0.1".to_string(),
+            assume_yes: false,
+        }
+    }
+}
+
+/// 报告表的一行: (路由, 目标端口, L1, L2, L3)。L2/L3 为 None 表示未探或跳过。
+pub type RouteRow = (String, String, model::L1, Option<model::L2>, Option<model::L3>);
+
+pub fn parse_args(args: &[String]) -> Result<Options, String> {
+    let mut o = Options::default();
+    let mut i = 0;
+    macro_rules! need {
+        ($f:expr) => {{
+            if i + 1 >= args.len() {
+                return Err(format!("{} 需要参数值。", $f));
+            }
+            i += 1;
+            args[i].clone()
+        }};
+    }
+    while i < args.len() {
+        let a = args[i].to_ascii_lowercase();
+        match a.as_str() {
+            "-c" | "--check-only" | "/c" | "check-only" => o.check_only = true,
+            "-r" | "--reinstall" | "/r" => o.reinstall = true,
+            "--yes" | "/yes" => o.assume_yes = true,
+            "--no-e2e" | "/no-e2e" => o.e2e = false,
+            "--root" | "-root" | "--openapi-root" | "/root" => o.root = Some(need!("--root")),
+            "--nginx-root" => o.nginx_root = Some(need!("--nginx-root")),
+            "--e2e-host" => o.e2e_host = need!("--e2e-host"),
+            "--components" => {
+                let v = need!("--components");
+                let list: Vec<String> = v
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if list.is_empty() {
+                    return Err("--components 不能为空。".to_string());
+                }
+                for k in &list {
+                    if !model::COMPONENTS.iter().any(|c| c.key == *k) {
+                        return Err(format!("未知组件 \"{}\"。", k));
+                    }
+                }
+                o.components = list;
+            }
+            "-h" | "--help" | "/?" | "help" => return Err(HELP.to_string()),
+            _ => return Err(format!("未知参数 \"{}\"。", args[i])),
+        }
+        i += 1;
+    }
+    Ok(o)
+}
+
+/// parse_args 用它表示"该打印帮助", 避免拿错误码字符串做判断。
+const HELP: &str = "\u{0}HELP";
+
+/// spec §9 报告表。每行: 路由 / 目标端口 / L1 / L2 / L3 / 结论。
+pub fn render_route_table(rows: &[RouteRow]) -> String {
+    use model::{L1, L2, L3};
+    let mut s = String::new();
+    s.push_str("路由              目标    L1      L2直连      L3经nginx   结论\n");
+    for (path, target, l1, l2, l3) in rows {
+        let v = model::attribute(*l1, *l2, *l3);
+        let l1s = if *l1 == L1::Listening { "监听" } else { "未监听" };
+        let l2s = match l2 {
+            Some(L2::Ok(c)) => format!("{}", c),
+            Some(L2::ServerError(c)) => format!("{}!", c),
+            Some(L2::Unexpected(c)) => format!("{}!", c),
+            Some(L2::NoHttpResponse) => "无HTTP响应".into(),
+            None => "-".into(),
+        };
+        let l3s = match l3 {
+            Some(L3::Ok(c)) => format!("{}", c),
+            Some(L3::Bad(c)) => format!("{}!", c),
+            Some(L3::Raw(c)) => format!("{}?", c),
+            Some(L3::TlsUnavailable) => "TLS不可用".into(),
+            Some(L3::NginxDown) => "443不可达".into(),
+            Some(L3::Skipped) | None => "-".into(),
+        };
+        s.push_str(&format!(
+            "{:<16}  {:<7}  {:<7}  {:<11}  {:<11}  {}\n",
+            path, target, l1s, l2s, l3s, v.cause
+        ));
+    }
+    s
+}
+
+fn run_flow(opts: &Options) -> i32 {
     let mut issues: u32 = 0;
-    let check_only = action == Action::CheckOnly;
-    let reinstall = action == Action::Reinstall;
+    let mut exit_max: u8 = 0;
 
     // == 1. 定位安装目录 ==
-    let mut root = PathBuf::from(root_arg.unwrap_or_else(|| DEFAULT_OPENAPI_ROOT.to_string()));
+    let mut root = PathBuf::from(opts.root.clone().unwrap_or_else(|| {
+        DEFAULT_OPENAPI_ROOT.to_string()
+    }));
     if !root.join("bin").is_dir() {
-        log(
-            Level::Err,
-            &format!("未找到 OpenAPI 目录: {}", root.display()),
-        );
+        log(Level::Err, &format!("未找到 OpenAPI 目录: {}", root.display()));
         if let Some(alt) = find_artemis_dir(Path::new(SEARCH_BASE)) {
             root = alt;
             log(Level::Warn, &format!("自动定位到: {}", root.display()));
@@ -664,9 +773,9 @@ fn run_flow(action: Action, root_arg: Option<String>) -> i32 {
     log(Level::Ok, &format!("node.exe: {}", node.display()));
 
     // == 3. 前置组件检查 (缺失仅告警) ==
+    // 9016 不在表里: 它现在是被修组件, 不再当前置告警
     log(Level::Step, "---- 前置组件检查 ----");
     const PREREQ: &[(u16, &str)] = &[
-        (9016, "artemis 网关(Java)"),
         (7019, "redis"),
         (5432, "postgresql"),
         (9000, "minio"),
@@ -684,35 +793,116 @@ fn run_flow(action: Action, root_arg: Option<String>) -> i32 {
         }
     }
 
-    // == 4. 组件修复 ==
-    // Task 9 会按 --components 选项重组这一段, 这里先接上新的 resolve/repair 契约
-    for def in model::COMPONENTS {
-        let rc = model::resolve_component(def, &root);
-        repair_component(&rc, &node, reinstall, check_only, false, &mut issues);
+    // == 4. nginx 归因 (只读, spec §7) ==
+    let nginx_root = match &opts.nginx_root {
+        Some(s) => Some(PathBuf::from(s)),
+        None => nginx::locate_nginx_conf(Path::new(SEARCH_BASE)),
+    };
+    match &nginx_root {
+        Some(nr) => {
+            log(Level::Ok, &format!("nginx 根目录: {}", nr.display()));
+            let info = nginx::load_nginx_info(nr);
+            // 只报 /artemis* 相关路由: 全量 proxy_pass 有上百条动态路由, 会淹没归因结论
+            let artemis_routes: Vec<&nginx::Route> = info
+                .routes
+                .iter()
+                .filter(|r| r.path.starts_with("/artemis"))
+                .collect();
+            for r in &artemis_routes {
+                let tgt = match &r.target {
+                    nginx::RouteTarget::Upstream(n) => format!("upstream {}", n),
+                    nginx::RouteTarget::Dynamic => "动态路由 (静态不可判定)".into(),
+                    nginx::RouteTarget::None => "无 proxy_pass".into(),
+                };
+                log(Level::Info, &format!("  location {} -> {}", r.path, tgt));
+            }
+            log(
+                Level::Info,
+                &format!(
+                    "  nginx 配置共 {} 条 location, 其中 /artemis* {} 条",
+                    info.routes.len(),
+                    artemis_routes.len()
+                ),
+            );
+            if let (Some(m), Some(loc)) = (&info.artemis_mode, &info.artemis_mode_loc) {
+                log(Level::Info, &format!("  set $artemis = \"{}\"  ({})", m, loc));
+            }
+            if info.loopback_risk() {
+                log(
+                    Level::Err,
+                    "$artemis 非 \"local\": /artemis* 会回环到 nginx 自身 (https_artemis_remote=127.0.0.1:443), 后端服务无需重启",
+                );
+                exit_max = exit_max.max(3);
+                issues += 1;
+            }
+        }
+        None => {
+            log(Level::Warn, "未定位到 nginx, L3 端到端与 nginx 归因跳过。");
+        }
     }
 
-    // == 5. 汇总 ==
+    // == 5. 组件修复 ==
+    let mut selected: Vec<model::ResolvedComponent> = Vec::new();
+    for key in &opts.components {
+        let def = match model::COMPONENTS.iter().find(|c| c.key == *key) {
+            Some(d) => d,
+            None => continue, // parse_args 已挡掉未知组件
+        };
+        let rc = model::resolve_component(def, &root);
+        let contrib =
+            repair_component(&rc, &node, opts.reinstall, opts.check_only, opts.assume_yes, &mut issues);
+        exit_max = exit_max.max(contrib);
+        selected.push(rc);
+    }
+
+    // == 6. 三层复测 + 报告表 ==
+    let nginx_up = probe::port_listening(443);
+    let mut rows: Vec<RouteRow> = Vec::new();
+    for rc in &selected {
+        if !rc.present {
+            continue;
+        }
+        let l1 = probe::port_listening(rc.port);
+        let l2 = if l1 {
+            Some(probe::http_probe_against(rc.port, &rc.pathname, &rc.def.l2_ok))
+        } else {
+            None
+        };
+        let l3 = if !opts.e2e {
+            Some(model::L3::Skipped)
+        } else {
+            let raw = probe::https_probe(&opts.e2e_host, 443, &format!("{}/", rc.pathname));
+            Some(probe::classify_l3(raw, &rc.def.l2_ok, nginx_up))
+        };
+        rows.push((
+            rc.pathname.clone(),
+            format!("{}", rc.port),
+            if l1 { model::L1::Listening } else { model::L1::NotListening },
+            l2,
+            l3,
+        ));
+    }
+    if !rows.is_empty() {
+        log(Level::Step, "==== 路由归因表 ====");
+        for line in render_route_table(&rows).lines() {
+            log(Level::Info, line);
+        }
+    }
+    for (_, _, l1, l2, l3) in &rows {
+        exit_max = exit_max.max(model::attribute(*l1, *l2, *l3).exit_contrib);
+    }
+
+    // == 7. 汇总 ==
     log(Level::Step, "==== 汇总 ====");
-    if check_only {
-        log(
-            Level::Info,
-            &format!("诊断完成 (未做任何修改)。发现问题数: {}", issues),
-        );
+    if opts.check_only {
+        log(Level::Info, &format!("诊断完成 (未做任何修改)。异常项: {}", issues));
     } else {
         log(Level::Info, &format!("修复流程完成。异常项: {}", issues));
-        log(
-            Level::Info,
-            "验证入口(本机): http://127.0.0.1:9017/artemis-web/  http://127.0.0.1:9018/artemis-portal/",
-        );
-        log(
-            Level::Info,
-            "经 nginx 443 对外: https://<本机IP>/artemis-web/  https://<本机IP>/artemis-portal/",
-        );
     }
-    if issues > 0 {
+    if issues > 0 && exit_max < 3 {
         1
     } else {
-        0
+        exit_max as i32
     }
 }
 
@@ -727,9 +917,9 @@ fn choose_action_interactive(admin: bool) -> Option<Action> {
             println!("  [!] 当前未以管理员身份运行: 选项 1 / 3 需要管理员权限");
             println!("      (可右键“以管理员身份运行”本程序)");
         }
-        println!("  [1] 标准修复  自动修复未运行的 artemis-web / artemis-portal 服务");
-        println!("  [2] 仅检查    只诊断不修改 (无需管理员权限)");
-        println!("  [3] 强制重装  即使服务运行中, 也卸载重装 (需要管理员权限)");
+        println!("  [1] 标准修复  三层探针 + 按类型修复 (Java 网关默认只 restart)");
+        println!("  [2] 仅检查    三层探针 + nginx 归因, 只读, 无需管理员");
+        println!("  [3] 强制重装  含网关 uninstall/install, 需交互确认");
         println!("  [0] 退出");
         print!("  请输入序号并回车 (直接回车默认 1): ");
         let _ = io::stdout().flush();
@@ -761,17 +951,24 @@ fn choose_action_interactive(admin: bool) -> Option<Action> {
 }
 
 fn usage() {
-    println!("RepairArtemisWeb — iSecure VMS OpenAPI artemis-web / artemis-portal 服务修复工具");
+    println!("RepairArtemisWeb — iSecure VMS OpenAPI 组件修复与三层归因诊断工具");
     println!();
     println!("用法:");
     println!("  RepairArtemisWeb.exe [选项]");
     println!();
     println!("选项:");
     println!("  -c, --check-only   仅诊断, 不做任何修改 (无需管理员权限)");
-    println!("  -r, --reinstall    强制卸载并重装服务 (即使服务正在运行)");
-    println!("  --root <目录>      指定 OpenAPI 根目录");
-    println!("                     默认: {}", DEFAULT_OPENAPI_ROOT);
+    println!("  -r, --reinstall    允许卸载并重装服务 (含 Java 网关)");
+    println!("      --components <a,b>  只处理指定组件, 默认 artemis,artemis-web,artemis-portal");
+    println!("      --root <目录>       指定 OpenAPI 根目录");
+    println!("                          默认: {}", DEFAULT_OPENAPI_ROOT);
+    println!("      --nginx-root <目录> 指定 nginx 根目录 (覆盖自动定位)");
+    println!("      --no-e2e            跳过 L3 端到端验收 (无 nginx / 离线环境)");
+    println!("      --e2e-host <主机>   L3 目标主机, 默认 127.0.0.1");
+    println!("      --yes               跳过网关重装的交互确认");
     println!("  -h, --help         显示此帮助");
+    println!();
+    println!("退出码: 0 无异常 · 1 存在异常或修复失败 · 2 参数错误 · 3 后端健康但 nginx 转发层故障");
     println!();
     println!("不带任何参数运行会进入中文交互式菜单。");
     println!();
@@ -783,72 +980,35 @@ fn main() {
     enable_vt();
 
     let args: Vec<String> = env::args().skip(1).collect();
-    let mut check_only = false;
-    let mut reinstall = false;
-    let mut root_arg: Option<String> = None;
-    let mut has_cli = false;
-
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i].to_ascii_lowercase();
-        match a.as_str() {
-            "-c" | "--check-only" | "/c" | "check-only" => {
-                check_only = true;
-                has_cli = true;
+    let opts = if args.is_empty() {
+        match choose_action_interactive(is_admin()) {
+            Some(a) => Options {
+                check_only: a == Action::CheckOnly,
+                reinstall: a == Action::Reinstall,
+                ..Default::default()
+            },
+            None => {
+                pause_if_console();
+                std::process::exit(0);
             }
-            "-r" | "--reinstall" | "/r" => {
-                reinstall = true;
-                has_cli = true;
-            }
-            "--root" | "-root" | "--openapi-root" | "/root" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("错误: {} 需要目录参数。", args[i - 1]);
-                    usage();
-                    std::process::exit(2);
-                }
-                root_arg = Some(args[i].clone());
-                has_cli = true;
-            }
-            "-h" | "--help" | "/?" | "help" => {
+        }
+    } else {
+        match parse_args(&args) {
+            Ok(o) => o,
+            Err(e) if e == HELP => {
                 usage();
                 std::process::exit(0);
             }
-            _ => {
-                eprintln!("错误: 未知参数 \"{}\"。", args[i]);
+            Err(e) => {
+                eprintln!("错误: {}", e);
                 usage();
+                pause_if_console();
                 std::process::exit(2);
             }
         }
-        i += 1;
-    }
-
-    let admin = is_admin();
-
-    // 有命令行参数 -> 命令行模式; 否则进入交互菜单。
-    let action: Option<Action> = if has_cli {
-        Some(if check_only {
-            Action::CheckOnly
-        } else if reinstall {
-            Action::Reinstall
-        } else {
-            Action::Repair
-        })
-    } else {
-        log(
-            Level::Step,
-            "==== iSecure VMS OpenAPI artemis-web/portal 修复工具 ====",
-        );
-        choose_action_interactive(admin)
     };
 
-    // 菜单选择"0 退出"
-    let Some(action) = action else {
-        pause_if_console();
-        std::process::exit(0);
-    };
-
-    if !admin && action != Action::CheckOnly {
+    if !is_admin() && !opts.check_only {
         log(
             Level::Err,
             "本工具需要管理员权限(注册/启动 Windows 服务), 请以管理员身份运行。",
@@ -857,7 +1017,7 @@ fn main() {
         std::process::exit(2);
     }
 
-    let code = run_flow(action, root_arg);
+    let code = run_flow(&opts);
     pause_if_console();
     std::process::exit(code);
 }
@@ -929,5 +1089,77 @@ mod tests {
             plan_repair(Node, SvcState::Running, false, false),
             vec![NodeUninstall, ScStop, ScDelete, NodeInstall, ScStart]
         );
+    }
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn 参数解析覆盖新选项() {
+        let o = parse_args(&argv(&[
+            "--check-only",
+            "--components",
+            "artemis-web,artemis-portal",
+            "--no-e2e",
+            "--nginx-root",
+            "D:/x",
+        ]))
+        .unwrap();
+        assert!(o.check_only);
+        assert_eq!(
+            o.components,
+            vec!["artemis-web".to_string(), "artemis-portal".to_string()]
+        );
+        assert!(!o.e2e);
+        assert_eq!(o.nginx_root.as_deref(), Some("D:/x"));
+        assert_eq!(o.e2e_host, "127.0.0.1");
+    }
+
+    #[test]
+    fn 默认组件表含三组件() {
+        let o = parse_args(&argv(&["--root", "C:/r"])).unwrap();
+        assert_eq!(
+            o.components,
+            vec!["artemis".to_string(), "artemis-web".to_string(), "artemis-portal".to_string()]
+        );
+        assert_eq!(o.root.as_deref(), Some("C:/r"));
+        assert!(!o.check_only && !o.reinstall && o.e2e);
+    }
+
+    #[test]
+    fn 未知参数与缺值报错不panic() {
+        assert!(parse_args(&argv(&["--bogus"])).is_err());
+        assert!(parse_args(&argv(&["--components"])).is_err());
+        assert!(parse_args(&argv(&["--root"])).is_err());
+        // 未知组件名必须报错, 不能静默忽略
+        assert!(parse_args(&argv(&["--components", "artemis-webb"])).is_err());
+        assert!(parse_args(&argv(&["--components", " , "])).is_err());
+    }
+
+    #[test]
+    fn 报告表把不一致行显式标出() {
+        use model::{L1, L2, L3};
+        let t = render_route_table(&[
+            (
+                "/artemis-web".into(),
+                "9017".into(),
+                L1::Listening,
+                Some(L2::Ok(200)),
+                Some(L3::Bad(502)),
+            ),
+            (
+                "/artemis".into(),
+                "9016".into(),
+                L1::NotListening,
+                None,
+                None,
+            ),
+        ]);
+        assert!(t.contains("/artemis-web"), "{}", t);
+        assert!(t.contains("502"), "必须显示实际状态码: {}", t);
+        assert!(t.contains("后端健康") || t.contains("nginx"), "必须给结论: {}", t);
+        assert!(t.contains("未监听"), "{}", t);
+        assert!(t.contains("9017"), "必须显示目标端口: {}", t);
     }
 }

@@ -1526,18 +1526,147 @@ static int repair_component(const ResolvedComponent& rc, const fs::path& node_ex
     return v.exit_contrib;
 }
 // ----------------------------------------------------------------------------
-// 主流程
+// 主流程 (与 Rust main::Options / parse_args / render_route_table / run_flow 对齐)
 // ----------------------------------------------------------------------------
 enum class Action { Repair = 1, CheckOnly = 2, Reinstall = 3 };
 
-static int run_flow(Action action, const std::wstring& root_arg) {
+struct Options {
+    bool check_only = false;
+    bool reinstall = false;
+    std::wstring root;          // 空 = 用默认
+    std::vector<std::string> components;
+    std::wstring nginx_root;    // 空 = 自动定位
+    bool e2e = true;
+    std::wstring e2e_host = L"127.0.0.1";
+    bool assume_yes = false;
+};
+
+static void options_default(Options& o) {
+    o = Options();
+    for (const ComponentDef& d : COMPONENTS) o.components.push_back(d.key);
+}
+
+static std::wstring lower_ascii(const std::wstring& s) {
+    std::wstring r = s;
+    for (wchar_t& c : r)
+        if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
+    return r;
+}
+
+// Rust 的 Result<Options, String> 在此用 bool + err 出参表达; want_help 单独置位。
+static bool parse_args(const std::vector<std::wstring>& args, Options& o,
+                       std::wstring& err, bool& want_help) {
+    options_default(o);
+    size_t i = 0;
+    std::wstring val;
+    while (i < args.size()) {
+        std::wstring a = lower_ascii(args[i]);
+        bool got = false;
+        if (i + 1 < args.size()) { val = args[i + 1]; got = true; }
+        if (a == L"-c" || a == L"--check-only" || a == L"/c" || a == L"check-only") {
+            o.check_only = true;
+        } else if (a == L"-r" || a == L"--reinstall" || a == L"/r") {
+            o.reinstall = true;
+        } else if (a == L"--yes" || a == L"/yes") {
+            o.assume_yes = true;
+        } else if (a == L"--no-e2e" || a == L"/no-e2e") {
+            o.e2e = false;
+        } else if (a == L"--root" || a == L"-root" || a == L"--openapi-root" || a == L"/root") {
+            if (!got) { err = L"--root 需要参数值。"; return false; }
+            o.root = val; ++i;
+        } else if (a == L"--nginx-root") {
+            if (!got) { err = L"--nginx-root 需要参数值。"; return false; }
+            o.nginx_root = val; ++i;
+        } else if (a == L"--e2e-host") {
+            if (!got) { err = L"--e2e-host 需要参数值。"; return false; }
+            o.e2e_host = val; ++i;
+        } else if (a == L"--components") {
+            if (!got) { err = L"--components 需要参数值。"; return false; }
+            std::string v = ws2utf8(val);
+            std::vector<std::string> list;
+            size_t pos = 0;
+            while (pos <= v.size()) {
+                size_t cm = v.find(',', pos);
+                std::string tok = (cm == std::string::npos) ? v.substr(pos)
+                                                            : v.substr(pos, cm - pos);
+                pos = (cm == std::string::npos) ? v.size() + 1 : cm + 1;
+                std::string t = trim(tok);
+                if (!t.empty()) list.push_back(t);
+            }
+            if (list.empty()) { err = L"--components 不能为空。"; return false; }
+            for (const std::string& k : list) {
+                bool known = false;
+                for (const ComponentDef& d : COMPONENTS)
+                    if (k == d.key) known = true;
+                if (!known) {
+                    err = L"未知组件 \"" + ascii_value_to_wide(k) + L"\"。";
+                    return false;
+                }
+            }
+            o.components = list;
+            ++i;
+        } else if (a == L"-h" || a == L"--help" || a == L"/?" || a == L"help") {
+            want_help = true;
+            return true;
+        } else {
+            err = L"未知参数 \"" + args[i] + L"\"。";
+            return false;
+        }
+        ++i;
+    }
+    return true;
+}
+
+struct RouteRow {
+    std::string path;
+    std::string target;
+    L1 l1;
+    bool has2;
+    L2 l2;
+    bool has3;
+    L3 l3;
+};
+
+// spec §9 报告表。每行: 路由 / 目标端口 / L1 / L2 / L3 / 结论。
+static std::string render_route_table(const std::vector<RouteRow>& rows) {
+    std::string s =
+        "路由              目标    L1      L2直连      L3经nginx   结论\n";
+    for (const RouteRow& r : rows) {
+        RouteVerdict v = attribute(r.l1, r.has2, r.l2, r.has3, r.l3);
+        const char* l1s = (r.l1 == L1::Listening) ? "监听" : "未监听";
+        char l2s[40], l3s[40], line[512];
+        if (!r.has2) std::snprintf(l2s, sizeof l2s, "-");
+        else switch (r.l2.kind) {
+            case L2Kind::Ok:            std::snprintf(l2s, sizeof l2s, "%u", r.l2.code); break;
+            case L2Kind::ServerError:
+            case L2Kind::Unexpected:    std::snprintf(l2s, sizeof l2s, "%u!", r.l2.code); break;
+            case L2Kind::NoHttpResponse:std::snprintf(l2s, sizeof l2s, "无HTTP响应"); break;
+        }
+        if (!r.has3) std::snprintf(l3s, sizeof l3s, "-");
+        else switch (r.l3.kind) {
+            case L3Kind::Ok:            std::snprintf(l3s, sizeof l3s, "%u", r.l3.code); break;
+            case L3Kind::Bad:
+            case L3Kind::Raw_:          std::snprintf(l3s, sizeof l3s, "%u!", r.l3.code); break;
+            case L3Kind::TlsUnavailable:std::snprintf(l3s, sizeof l3s, "TLS不可用"); break;
+            case L3Kind::NginxDown:     std::snprintf(l3s, sizeof l3s, "443不可达"); break;
+            case L3Kind::Skipped:       std::snprintf(l3s, sizeof l3s, "-"); break;
+        }
+        std::snprintf(line, sizeof line, "%-16s  %-7s  %-7s  %-11s  %-11s  %s\n",
+                      r.path.c_str(), r.target.c_str(), l1s, l2s, l3s, v.cause);
+        s += line;
+    }
+    return s;
+}
+
+static int run_flow(const Options& opts) {
     unsigned int issues = 0;
-    bool check_only = action == Action::CheckOnly;
-    bool reinstall = action == Action::Reinstall;
+    unsigned int exit_max = 0;
+    bool check_only = opts.check_only;
+    bool reinstall = opts.reinstall;
 
     // == 1. 定位安装目录 ==
-    fs::path root = root_arg.empty() ? fs::path(DEFAULT_OPENAPI_ROOT)
-                                     : fs::path(root_arg);
+    fs::path root = opts.root.empty() ? fs::path(DEFAULT_OPENAPI_ROOT)
+                                      : fs::path(opts.root);
     std::error_code ec;
     if (!fs::is_directory(root / L"bin", ec)) {
         logf(Level::Err, "未找到 OpenAPI 目录: %s",
@@ -1568,10 +1697,10 @@ static int run_flow(Action action, const std::wstring& root_arg) {
     logf(Level::Ok, "node.exe: %s", decode_to_utf8(node.native()).c_str());
 
     // == 3. 前置组件检查 (缺失仅告警) ==
+    // 9016 不在表里: 它现在是被修组件, 不再当前置告警
     log(Level::Step, "---- 前置组件检查 ----");
     struct Prereq { unsigned short port; const char* desc; };
     static const Prereq PREREQ[] = {
-        { 9016, "artemis 网关(Java)" },
         { 7019, "redis" },
         { 5432, "postgresql" },
         { 9000, "minio" },
@@ -1588,27 +1717,97 @@ static int run_flow(Action action, const std::wstring& root_arg) {
         }
     }
 
-    // == 4. 组件修复 ==
-    // Task 9 会按 --components 选项重组这一段, 这里先接上新的 resolve/repair 契约
-    for (const ComponentDef& def : COMPONENTS) {
-        ResolvedComponent rc = resolve_component(def, root);
-        repair_component(rc, node, reinstall, check_only, false, issues);
+    // == 4. nginx 归因 (只读, spec §7) ==
+    fs::path nginx_root;
+    if (!opts.nginx_root.empty()) nginx_root = opts.nginx_root;
+    else if (!locate_nginx_conf(fs::path(SEARCH_BASE), nginx_root)) nginx_root.clear();
+
+    if (!nginx_root.empty()) {
+        logf(Level::Ok, "nginx 根目录: %s", decode_to_utf8(nginx_root.native()).c_str());
+        NginxInfo info = load_nginx_info(nginx_root);
+        // 只报 /artemis* 相关路由: 全量 proxy_pass 有上百条动态路由, 会淹没归因结论
+        size_t artemis_n = 0;
+        for (const Route& r : info.routes) {
+            if (r.path.compare(0, 8, "/artemis") != 0) continue;
+            ++artemis_n;
+            std::string tgt;
+            if (r.target == RouteTargetKind::Upstream_) tgt = "upstream " + r.upstream;
+            else if (r.target == RouteTargetKind::Dynamic) tgt = "动态路由 (静态不可判定)";
+            else tgt = "无 proxy_pass";
+            logf(Level::Info, "  location %s -> %s", r.path.c_str(), tgt.c_str());
+        }
+        logf(Level::Info, "  nginx 配置共 %zu 条 location, 其中 /artemis* %zu 条",
+             info.routes.size(), artemis_n);
+        if (!info.artemis_mode.empty()) {
+            logf(Level::Info, "  set $artemis = \"%s\"  (%s)",
+                 info.artemis_mode.c_str(), info.artemis_mode_loc.c_str());
+        }
+        if (info.loopback_risk()) {
+            log(Level::Err,
+                "$artemis 非 \"local\": /artemis* 会回环到 nginx 自身 "
+                "(https_artemis_remote=127.0.0.1:443), 后端服务无需重启");
+            exit_max = 3;
+            ++issues;
+        }
+    } else {
+        log(Level::Warn, "未定位到 nginx, L3 端到端与 nginx 归因跳过。");
     }
 
-    // == 5. 汇总 ==
+    // == 5. 组件修复 ==
+    std::vector<ResolvedComponent> selected;
+    for (const std::string& key : opts.components) {
+        for (const ComponentDef& def : COMPONENTS) {
+            if (key != def.key) continue;
+            ResolvedComponent rc = resolve_component(def, root);
+            int contrib = repair_component(rc, node, reinstall, check_only,
+                                           opts.assume_yes, issues);
+            if ((unsigned)contrib > exit_max) exit_max = (unsigned)contrib;
+            selected.push_back(rc);
+        }
+    }
+
+    // == 6. 三层复测 + 报告表 ==
+    bool nginx_up = port_listening(443);
+    std::vector<RouteRow> rows;
+    for (const ResolvedComponent& rc : selected) {
+        if (!rc.present) continue;
+        RouteRow row;
+        row.path = ws2utf8(rc.pathname);
+        row.target = std::to_string(rc.port);
+        bool l1 = port_listening(rc.port);
+        row.l1 = l1 ? L1::Listening : L1::NotListening;
+        L2 noresp; noresp.kind = L2Kind::NoHttpResponse; noresp.code = 0;
+        row.has2 = l1;
+        row.l2 = l1 ? http_probe_against(rc.port, ws2utf8(rc.pathname), rc.def->l2_ok)
+                    : noresp;
+        if (!opts.e2e) {
+            row.has3 = true;
+            row.l3.kind = L3Kind::Skipped; row.l3.code = 0;
+        } else {
+            std::string with_slash = row.path + "/";
+            L3 raw = https_probe(ws2utf8(opts.e2e_host), 443, with_slash);
+            row.has3 = true;
+            row.l3 = classify_l3(raw, rc.def->l2_ok, nginx_up);
+        }
+        RouteVerdict v = attribute(row.l1, row.has2, row.l2, row.has3, row.l3);
+        if (v.exit_contrib > exit_max) exit_max = v.exit_contrib;
+        rows.push_back(row);
+    }
+    if (!rows.empty()) {
+        log(Level::Step, "==== 路由归因表 ====");
+        std::string table = render_route_table(rows);
+        for (const std::string& line : split_lines(table)) log(Level::Info, line);
+    }
+
+    // == 7. 汇总 ==
     log(Level::Step, "==== 汇总 ====");
     if (check_only) {
-        logf(Level::Info, "诊断完成 (未做任何修改)。发现问题数: %u", issues);
+        logf(Level::Info, "诊断完成 (未做任何修改)。异常项: %u", issues);
     } else {
         logf(Level::Info, "修复流程完成。异常项: %u", issues);
-        log(Level::Info,
-            "验证入口(本机): http://127.0.0.1:9017/artemis-web/  "
-            "http://127.0.0.1:9018/artemis-portal/");
-        log(Level::Info,
-            "经 nginx 443 对外: https://<本机IP>/artemis-web/  "
-            "https://<本机IP>/artemis-portal/");
     }
-    return issues > 0 ? 1 : 0;
+    if (issues > 0 && exit_max < 3) return 1;
+    return (int)exit_max;
 }
 
 // 交互菜单: 返回 Action 值; -1 = 退出
@@ -1623,9 +1822,9 @@ static int choose_action_interactive(bool admin) {
             std::printf("  [!] 当前未以管理员身份运行: 选项 1 / 3 需要管理员权限\n");
             std::printf("      (可右键“以管理员身份运行”本程序)\n");
         }
-        std::printf("  [1] 标准修复  自动修复未运行的 artemis-web / artemis-portal 服务\n");
-        std::printf("  [2] 仅检查    只诊断不修改 (无需管理员权限)\n");
-        std::printf("  [3] 强制重装  即使服务运行中, 也卸载重装 (需要管理员权限)\n");
+        std::printf("  [1] 标准修复  三层探针 + 按类型修复 (Java 网关默认只 restart)\n");
+        std::printf("  [2] 仅检查    三层探针 + nginx 归因, 只读, 无需管理员\n");
+        std::printf("  [3] 强制重装  含网关 uninstall/install, 需交互确认\n");
         std::printf("  [0] 退出\n");
         std::printf("  请输入序号并回车 (直接回车默认 1): ");
         std::fflush(stdout);
@@ -1653,31 +1852,31 @@ static int choose_action_interactive(bool admin) {
         std::fflush(stdout);
     }
 }
-
 static void usage() {
-    std::printf("RepairArtemisWeb — iSecure VMS OpenAPI artemis-web / artemis-portal 服务修复工具\n");
+    std::printf("RepairArtemisWeb — iSecure VMS OpenAPI 组件修复与三层归因诊断工具\n");
     std::printf("\n");
     std::printf("用法:\n");
     std::printf("  RepairArtemisWeb.exe [选项]\n");
     std::printf("\n");
     std::printf("选项:\n");
     std::printf("  -c, --check-only   仅诊断, 不做任何修改 (无需管理员权限)\n");
-    std::printf("  -r, --reinstall    强制卸载并重装服务 (即使服务正在运行)\n");
-    std::printf("  --root <目录>      指定 OpenAPI 根目录\n");
-    std::printf("                     默认: %s\n", DEFAULT_OPENAPI_ROOT);
+    std::printf("  -r, --reinstall    允许卸载并重装服务 (含 Java 网关)\n");
+    std::printf("      --components <a,b>  只处理指定组件, 默认 artemis,artemis-web,artemis-portal\n");
+    std::printf("      --root <目录>       指定 OpenAPI 根目录\n");
+    std::printf("                          默认: ");
+    std::printf("%ls\n", DEFAULT_OPENAPI_ROOT);
+    std::printf("      --nginx-root <目录> 指定 nginx 根目录 (覆盖自动定位)\n");
+    std::printf("      --no-e2e            跳过 L3 端到端验收 (无 nginx / 离线环境)\n");
+    std::printf("      --e2e-host <主机>   L3 目标主机, 默认 127.0.0.1\n");
+    std::printf("      --yes               跳过网关重装的交互确认\n");
     std::printf("  -h, --help         显示此帮助\n");
+    std::printf("\n");
+    std::printf("退出码: 0 无异常 · 1 存在异常或修复失败 · 2 参数错误 · 3 后端健康但 nginx 转发层故障\n");
     std::printf("\n");
     std::printf("不带任何参数运行会进入中文交互式菜单。\n");
     std::printf("\n");
     std::printf("开发人: 余志强    QQ: 379008610    主页: https://github.com/xiaoyuzhi\n");
     std::printf("版权: Copyright (c) 2026 余志强 (Yu Zhiqiang). All rights reserved.\n");
-}
-
-static std::wstring lower_ascii(const std::wstring& s) {
-    std::wstring r = s;
-    for (wchar_t& c : r)
-        if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
-    return r;
 }
 
 int wmain(int argc, wchar_t** argv) {
@@ -1686,51 +1885,9 @@ int wmain(int argc, wchar_t** argv) {
     std::vector<std::wstring> args;
     for (int i = 1; i < argc; ++i) args.push_back(argv[i]);
 
-    bool check_only = false;
-    bool reinstall = false;
-    std::wstring root_arg;
-    bool has_cli = false;
-
-    for (size_t i = 0; i < args.size(); ++i) {
-        std::wstring a = lower_ascii(args[i]);
-        if (a == L"-c" || a == L"--check-only" || a == L"/c" ||
-            a == L"check-only") {
-            check_only = true;
-            has_cli = true;
-        } else if (a == L"-r" || a == L"--reinstall" || a == L"/r") {
-            reinstall = true;
-            has_cli = true;
-        } else if (a == L"--root" || a == L"-root" || a == L"--openapi-root" ||
-                   a == L"/root") {
-            if (i + 1 >= args.size()) {
-                logf(Level::Err, "错误: %s 需要目录参数。",
-                     decode_to_utf8(args[i]).c_str());
-                usage();
-                return 2;
-            }
-            root_arg = args[i + 1];
-            ++i;
-            has_cli = true;
-        } else if (a == L"-h" || a == L"--help" || a == L"/?" || a == L"help") {
-            usage();
-            return 0;
-        } else {
-            logf(Level::Err, "错误: 未知参数 \"%s\"。",
-                 decode_to_utf8(args[i]).c_str());
-            usage();
-            return 2;
-        }
-    }
-
+    Options opts;
     bool admin = is_admin();
-
-    // 有命令行参数 -> 命令行模式; 否则进入交互菜单。
-    Action action;
-    if (has_cli) {
-        if (check_only) action = Action::CheckOnly;
-        else if (reinstall) action = Action::Reinstall;
-        else action = Action::Repair;
-    } else {
+    if (args.empty()) {
         log(Level::Step,
             "==== iSecure VMS OpenAPI artemis-web/portal 修复工具 ====");
         int sel = choose_action_interactive(admin);
@@ -1738,17 +1895,28 @@ int wmain(int argc, wchar_t** argv) {
             pause_if_console();
             return 0;
         }
-        action = (Action)sel;
+        options_default(opts);
+        opts.check_only = (Action)sel == Action::CheckOnly;
+        opts.reinstall = (Action)sel == Action::Reinstall;
+    } else {
+        std::wstring err;
+        bool want_help = false;
+        if (!parse_args(args, opts, err, want_help)) {
+            logf(Level::Err, "错误: %s", decode_to_utf8(err).c_str());
+            usage();
+            return 2;
+        }
+        if (want_help) { usage(); return 0; }
     }
 
-    if (!admin && action != Action::CheckOnly) {
+    if (!admin && !opts.check_only) {
         log(Level::Err,
             "本工具需要管理员权限(注册/启动 Windows 服务), 请以管理员身份运行。");
         pause_if_console();
         return 2;
     }
 
-    int code = run_flow(action, root_arg);
+    int code = run_flow(opts);
     pause_if_console();
     return code;
 }
