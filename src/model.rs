@@ -259,7 +259,7 @@ pub fn attribute(l1: L1, l2: Option<L2>, l3: Option<L3>) -> RouteVerdict {
     }
     match (l2, l3) {
         (Some(L2::NoHttpResponse), _) => {
-            v!("端口已被非 HTTP 进程占用", VerdictAction::ReportOccupier, 1)
+            v!("端口已监听但无 HTTP 响应 (疑被非 HTTP 进程占用)", VerdictAction::ReportOccupier, 1)
         }
         (Some(L2::ServerError(_)), _) => {
             v!("应用已启动但返回 5xx", VerdictAction::ShowLog, 1)

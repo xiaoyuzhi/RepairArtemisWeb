@@ -48,6 +48,260 @@
 
 namespace fs = std::filesystem;
 
+static std::string ltrim(const std::string& s) {
+    size_t b = s.find_first_not_of(" \t");
+    return b == std::string::npos ? std::string() : s.substr(b);
+}
+static std::string rtrim(const std::string& s) {
+    size_t e = s.find_last_not_of(" \t");
+    return e == std::string::npos ? std::string() : s.substr(0, e + 1);
+}
+static std::string trim(const std::string& s) { return ltrim(rtrim(s)); }
+static std::vector<std::string> split_lines(const std::string& text) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    while (true) {
+        size_t nl = text.find('\n', pos);
+        if (nl == std::string::npos) {
+            if (pos < text.size()) out.push_back(text.substr(pos));
+            break;
+        }
+        out.push_back(text.substr(pos, nl - pos));
+        pos = nl + 1;
+    }
+    for (std::string& s : out)
+        if (!s.empty() && s.back() == '\r') s.pop_back();
+    return out;
+}
+static bool starts_with(const std::string& s, const char* p) {
+    size_t n = std::strlen(p);
+    return s.size() >= n && s.compare(0, n, p) == 0;
+}
+static bool is_all_digits(const std::string& s) {
+    if (s.empty()) return false;
+    for (char c : s) if (c < '0' || c > '9') return false;
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// 前向声明 (本文件按 工具 -> 模型 -> 解析 -> 探针 -> 修复 组织, 存在跨段互调)
+// ----------------------------------------------------------------------------
+static std::wstring ascii_value_to_wide(const std::string& v);
+static std::string read_file_narrow(const fs::path& p);
+static std::map<std::string, std::string> parse_properties(const std::string& text);
+static bool parse_status_line(const std::string& line, unsigned short& out);
+static std::string ws2utf8(const std::wstring& w);
+
+// ----------------------------------------------------------------------------
+// 组件描述表 (与 Rust model::Kind / StatusSet / ComponentDef / COMPONENTS 对齐)
+// ----------------------------------------------------------------------------
+enum class Kind { Node, Prunsrv };
+
+// spec §5: 不设"非 5xx 即活"的宽泛规则。
+struct StatusSet {
+    bool two, three, four_zero_four;
+    bool accepts(unsigned short code) const {
+        if (two && code >= 200 && code < 300) return true;
+        if (three && code >= 300 && code < 400) return true;
+        if (four_zero_four && code == 404) return true;
+        return false;
+    }
+};
+static const StatusSet SS_WEB     = { true, true, false };
+static const StatusSet SS_GATEWAY = { true, true, true  };
+
+struct ComponentDef {
+    const char*   key;
+    Kind          kind;
+    const wchar_t* rel_dir;
+    const wchar_t* present_marker;
+    const wchar_t* default_svc;
+    unsigned short default_port;
+    const wchar_t* default_pathname;
+    StatusSet     l2_ok;
+    unsigned      start_timeout_secs;
+};
+
+// 顺序即修复顺序: 网关先于 web/portal。
+static const ComponentDef COMPONENTS[3] = {
+    { "artemis", Kind::Prunsrv, L"bin\\artemis", L"bin\\windows\\artemis.exe",
+      L"artemis", 9016, L"/artemis", SS_GATEWAY, 90 },
+    { "artemis-web", Kind::Node, L"bin\\artemis-web\\artemis-web", L"koa-app.js",
+      L"artemis-web", 9017, L"/artemis-web", SS_WEB, 60 },
+    { "artemis-portal", Kind::Node, L"bin\\artemis-portal\\artemis-portal", L"koa-app.js",
+      L"artemis-portal", 9018, L"/artemis-portal", SS_WEB, 60 },
+};
+
+struct ResolvedComponent {
+    const ComponentDef* def;
+    fs::path              dir;
+    std::wstring          svc_name;
+    unsigned short        port;
+    std::wstring          pathname;
+    bool                  present;
+    std::vector<std::string> warnings;
+};
+
+static std::string read_file_narrow(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return std::string();
+    return std::string((std::istreambuf_iterator<char>(f)),
+                       std::istreambuf_iterator<char>());
+}
+
+// 把 "set KEY=VALUE" 归一成 properties 行后复用 parse_properties。
+// 循环内不得早退, 首个不匹配行必须继续扫描。
+static bool parse_server_name_from_bat(const std::string& text, std::string& out) {
+    std::string props;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t nl = text.find('\n', pos);
+        std::string raw = (nl == std::string::npos) ? text.substr(pos)
+                                                    : text.substr(pos, nl - pos);
+        pos = (nl == std::string::npos) ? text.size() + 1 : nl + 1;
+        if (!raw.empty() && raw.back() == '\r') raw.pop_back();
+        size_t b = raw.find_first_not_of(" \t");
+        if (b == std::string::npos) continue;
+        std::string t = raw.substr(b);
+        if (t.compare(0, 4, "set ") != 0) continue;
+        props += t.substr(4);
+        props += '\n';
+    }
+    std::map<std::string, std::string> m = parse_properties(props);
+    std::map<std::string, std::string>::iterator it = m.find("_ServerName");
+    if (it == m.end()) return false;
+    std::string v = it->second;
+    while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
+    // 等价于 Rust 的 trim_matches('"'): 两端引号成对或单个都要去掉
+    while (v.size() >= 2 && v.front() == '"' && v.back() == '"')
+        v = v.substr(1, v.size() - 2);
+    if (v.empty()) return false;
+    out = v;
+    return true;
+}
+
+static std::map<std::string, std::string> props_for(const ComponentDef& def,
+                                                    const fs::path& dir) {
+    const wchar_t* name = (def.kind == Kind::Node) ? L"config.properties"
+                                                   : L"application.properties";
+    return parse_properties(read_file_narrow(dir / name));
+}
+
+// 读配置得到 svc/port/pathname; 任一失败则用兜底值并记 Warn (spec §5)。
+static ResolvedComponent resolve_component(const ComponentDef& def, const fs::path& root) {
+    ResolvedComponent c;
+    c.def = &def;
+    c.dir = root / def.rel_dir;
+    std::map<std::string, std::string> p = props_for(def, c.dir);
+
+    if (def.kind == Kind::Prunsrv) {
+        std::string bat = read_file_narrow(c.dir / L"bin" / L"__service.bat");
+        std::string nm;
+        if (!bat.empty() && parse_server_name_from_bat(bat, nm)) {
+            c.svc_name = ascii_value_to_wide(nm);
+        } else {
+            c.warnings.push_back(std::string("未读到 _ServerName, 用兜底服务名 ") + def.key);
+            c.svc_name = def.default_svc;
+        }
+    } else {
+        std::map<std::string, std::string>::iterator it = p.find("service.name");
+        if (it != p.end() && !it->second.empty()) {
+            c.svc_name = ascii_value_to_wide(it->second);
+        } else {
+            c.warnings.push_back(std::string("未读到 service.name, 用兜底服务名 ") + def.key);
+            c.svc_name = def.default_svc;
+        }
+    }
+
+    std::map<std::string, std::string>::iterator pit = p.find("server.port");
+    bool port_ok = false;
+    c.port = def.default_port;
+    if (pit != p.end()) {
+        const std::string& s = pit->second;
+        port_ok = !s.empty();
+        for (char ch : s) if (ch < '0' || ch > '9') { port_ok = false; break; }
+        if (port_ok) {
+            unsigned long pv = std::strtoul(s.c_str(), nullptr, 10);
+            port_ok = (pv > 0 && pv <= 65535);
+            if (port_ok) c.port = (unsigned short)pv;
+        }
+    }
+    if (!port_ok) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "未读到 server.port, 用兜底端口 %u", def.default_port);
+        c.warnings.push_back(buf);
+    }
+
+    const char* key = (def.kind == Kind::Prunsrv) ? "server.context-path" : "server.pathname";
+    std::map<std::string, std::string>::iterator tit = p.find(key);
+    if (tit != p.end() && !tit->second.empty()) {
+        std::string path = tit->second;
+        while (path.size() > 1 && path.back() == '/') path.pop_back();  // 等价 trim_end_matches('/')
+        c.pathname = ascii_value_to_wide(path);
+    } else {
+        c.pathname = def.default_pathname;
+        c.warnings.push_back(std::string("未读到 ") + key + ", 用兜底路径 "
+                             + ws2utf8(std::wstring(def.default_pathname)));
+    }
+
+    std::error_code ec;
+    c.present = fs::is_regular_file(c.dir / def.present_marker, ec);
+    return c;
+}
+
+// ----------------------------------------------------------------------------
+// 三层探针结果与归因矩阵 (与 Rust model::L1/L2/L3/attribute 对齐, spec §6)
+// ----------------------------------------------------------------------------
+enum class L1 { Listening, NotListening };
+
+enum class L2Kind { Ok, ServerError, Unexpected, NoHttpResponse };
+struct L2 {
+    L2Kind kind;
+    unsigned short code;  // NoHttpResponse 时无意义
+};
+
+enum class L3Kind { Ok, Bad, TlsUnavailable, NginxDown, Skipped };
+struct L3 {
+    L3Kind kind;
+    unsigned short code;  // 仅 Ok/Bad 有意义
+};
+
+enum class VerdictAction { None_, RepairBackend, ReportOccupier, ShowLog, NginxAttrib, Unverifiable };
+
+struct RouteVerdict {
+    const char*   cause;
+    VerdictAction action;
+    unsigned char exit_contrib;  // 0/1/3
+};
+
+// 首次匹配, 顺序即优先级 (与 Rust 的 match 臂顺序逐条对应)。
+// Rust 的 Option<L2>/Option<L3> 在此用 has2/has3 表达。
+static RouteVerdict attribute(L1 l1, bool has2, L2 l2, bool has3, L3 l3) {
+    if (l1 == L1::NotListening)
+        return { "后端未监听端口", VerdictAction::RepairBackend, 1 };
+    // 行3 端口被非 HTTP 进程占用
+    if (has2 && l2.kind == L2Kind::NoHttpResponse)
+        return { "端口已被非 HTTP 进程占用", VerdictAction::ReportOccupier, 1 };
+    // 行4 5xx
+    if (has2 && l2.kind == L2Kind::ServerError)
+        return { "应用已启动但返回 5xx", VerdictAction::ShowLog, 1 };
+    // 行7 非期望状态码
+    if (has2 && l2.kind == L2Kind::Unexpected)
+        return { "后端响应不符合期望状态码", VerdictAction::RepairBackend, 1 };
+    // 行5/6 后端健康但转发层故障
+    if (has2 && l2.kind == L2Kind::Ok && has3
+        && (l3.kind == L3Kind::Bad || l3.kind == L3Kind::NginxDown))
+        return { "后端健康, nginx 转发层故障", VerdictAction::NginxAttrib, 3 };
+    // Review Focus #4: TLS 不可用不得判成后端或 nginx 故障
+    if (has2 && l2.kind == L2Kind::Ok && has3 && l3.kind == L3Kind::TlsUnavailable)
+        return { "端到端无法验证 (TLS 层不可用)", VerdictAction::Unverifiable, 0 };
+    if (has2 && l2.kind == L2Kind::Ok)
+        return { "正常", VerdictAction::None_, 0 };
+    return { "后端未响应, 探针未取到结果", VerdictAction::RepairBackend, 1 };
+}
+
+
+
 // ----------------------------------------------------------------------------
 // 全局
 // ----------------------------------------------------------------------------
@@ -336,50 +590,40 @@ static void run_node_logged(const fs::path& node_exe, const fs::path& script,
 // ----------------------------------------------------------------------------
 // 端口 / HTTP 检查
 // ----------------------------------------------------------------------------
-static bool port_netstat(unsigned short port) {
+// 解析 netstat -ano 的一行; 处于 LISTENING 才返回 true 并写出端口与 PID
+static bool netstat_listen_pid(const std::string& line,
+                               unsigned short& port, unsigned long& pid) {
+    std::istringstream ss(line);
+    std::string proto, local, peer, state, pidtok;
+    if (!(ss >> proto)) return false;
+    if (proto != "TCP") return false;
+    if (!(ss >> local >> peer >> state)) return false;
+    if (state.find("LISTENING") == std::string::npos
+        && state.find("LISTEN") == std::string::npos) return false;
+    if (!(ss >> pidtok)) return false;
+    if (!is_all_digits(pidtok)) return false;
+    size_t colon = local.find_last_of(':');
+    if (colon == std::string::npos) return false;
+    std::string pstr = local.substr(colon + 1);
+    if (!pstr.empty() && pstr.back() == ']') pstr.pop_back();
+    if (!is_all_digits(pstr)) return false;
+    unsigned long pv = std::strtoul(pstr.c_str(), nullptr, 10);
+    if (pv == 0 || pv > 65535) return false;
+    port = (unsigned short)pv;
+    pid = std::strtoul(pidtok.c_str(), nullptr, 10);
+    return true;
+}
+
+// 遍历 netstat 输出; want_pid=false 时命中即返回端口, true 时返回占用 PID
+static bool scan_netstat(unsigned short want, unsigned short& got_port,
+                         unsigned long& got_pid, bool want_pid) {
     RunRes r = run_output(L"netstat", { L"-ano" }, nullptr);
-    if (!r.launched) return false;
-    std::string out = r.out;
-    size_t pos = 0;
-    while (pos <= out.size()) {
-        size_t nl = out.find('\n', pos);
-        std::string line = (nl == std::string::npos) ? out.substr(pos)
-                                                     : out.substr(pos, nl - pos);
-        pos = (nl == std::string::npos) ? out.size() + 1 : nl + 1;
-
-        std::vector<std::string> toks;
-        size_t p = 0;
-        while (p < line.size()) {
-            while (p < line.size() && (line[p] == ' ' || line[p] == '\t' || line[p] == '\r')) ++p;
-            size_t q = p;
-            while (q < line.size() && line[q] != ' ' && line[q] != '\t' && line[q] != '\r') ++q;
-            if (q > p) toks.push_back(line.substr(p, q - p));
-            p = q;
-        }
-        if (toks.size() < 2) continue;
-
-        std::string local = toks[1];
-        size_t ci = local.rfind(':');
-        if (ci == std::string::npos) continue;
-        std::string portstr = local.substr(ci + 1);
-        while (!portstr.empty() && portstr.back() == ']') portstr.pop_back();
-        if (portstr.empty()) continue;
-        unsigned long pnum = 0;
-        bool isdig = true;
-        for (char c : portstr) if (c < '0' || c > '9') { isdig = false; break; }
-        if (!isdig) continue;
-        pnum = std::strtoul(portstr.c_str(), nullptr, 10);
-        if (pnum != port) continue;
-
-        bool listening = false;
-        for (size_t k = 2; k < toks.size(); ++k) {
-            if (toks[k].find("LISTENING") != std::string::npos ||
-                toks[k].find("LISTEN") != std::string::npos) {
-                listening = true;
-                break;
-            }
-        }
-        if (listening) return true;
+    for (const std::string& line : split_lines(r.out)) {
+        unsigned short port; unsigned long pid;
+        if (!netstat_listen_pid(line, port, pid)) continue;
+        if (port != want) continue;
+        if (want_pid) { got_pid = pid; return true; }
+        got_port = port; return true;
     }
     return false;
 }
@@ -429,69 +673,67 @@ static bool tcp_probe(unsigned short port, int timeoutMs) {
     return ok;
 }
 
-// 端口监听判定: netstat 优先, TCP 连通测试兜底
+// L1: netstat 优先, TCP 连通测试兜底 (防状态字被本地化)
 static bool port_listening(unsigned short port) {
-    if (port_netstat(port)) return true;
+    unsigned short got = 0; unsigned long dummy = 0;
+    if (scan_netstat(port, got, dummy, false)) return true;
     return tcp_probe(port, 1000);
 }
 
-// HTTP 健康检查: 只要求有 HTTP 响应 (200/302/404 均算服务已起)
-static bool http_up(unsigned short port, const std::string& pathname) {
+// spec §6 行3: 端口被非 HTTP 进程占用时报告 PID
+static bool port_owner_pid(unsigned short port, unsigned long& pid) {
+    unsigned short dummy = 0;
+    return scan_netstat(port, dummy, pid, true);
+}
+
+// 5xx 优先归 ServerError, 其余按期望集合。spec §5: 不设"非 5xx 即活"。
+static L2 classify(unsigned short code, const StatusSet& set) {
+    L2 r;
+    r.code = code;
+    if (code >= 500 && code < 600) r.kind = L2Kind::ServerError;
+    else if (set.accepts(code))    r.kind = L2Kind::Ok;
+    else                           r.kind = L2Kind::Unexpected;
+    return r;
+}
+
+// 明文 HTTP GET, 读到状态行为止。硬超时, 拿不到状态行 -> NoHttpResponse。
+static L2 http_probe_against(unsigned short port, const std::string& pathname,
+                             const StatusSet& set) {
+    L2 fail; fail.kind = L2Kind::NoHttpResponse; fail.code = 0;
     ensure_winsock();
     SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s == INVALID_SOCKET) return false;
-    u_long nb = 1;
-    ioctlsocket(s, FIONBIO, &nb);
+    if (s == INVALID_SOCKET) return fail;
+    int ms = 8000;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&ms, sizeof ms);
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ms, sizeof ms);
     sockaddr_in a;
     std::memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     a.sin_port = htons(port);
     inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
-
-    int r = connect(s, (sockaddr*)&a, sizeof a);
-    bool connected = false;
-    if (r == 0) {
-        connected = true;
-    } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
-        fd_set wf;
-        FD_ZERO(&wf);
-        FD_SET(s, &wf);
-        timeval tv{ 8, 0 };
-        int sel = select(0, nullptr, &wf, nullptr, &tv);
-        if (sel == 1) {
-            int err = 0;
-            int len = sizeof err;
-            getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&err, &len);
-            connected = (err == 0);
-        }
-    }
-    if (!connected) {
-        closesocket(s);
-        return false;
-    }
-    // 恢复阻塞, 设置读写超时
-    nb = 0;
-    ioctlsocket(s, FIONBIO, &nb);
-    DWORD tmo = 8000;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof tmo);
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tmo, sizeof tmo);
-
+    std::string path = pathname.empty() ? "/" : pathname;
     char req[512];
-    std::snprintf(req, sizeof req,
-                  "GET /%s/ HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
-                  "User-Agent: RepairArtemisWeb\r\nConnection: close\r\n\r\n",
-                  pathname.c_str(), (unsigned)port);
-    int sr = send(s, req, (int)std::strlen(req), 0);
-    if (sr <= 0) {
-        closesocket(s);
-        return false;
+    snprintf(req, sizeof req,
+             "GET %s HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+             "User-Agent: RepairArtemisWeb\r\nConnection: close\r\n\r\n",
+             path.c_str(), port);
+    if (send(s, req, (int)std::strlen(req), 0) == SOCKET_ERROR) {
+        closesocket(s); return fail;
     }
-    char buf[512];
-    int nr = recv(s, buf, sizeof buf, 0);
+    // 逐字节读到首个 CRLF 即停, 不等响应体
+    std::string line;
+    char prev = 0, c = 0;
+    while (line.size() < 128) {
+        int n = recv(s, &c, 1, 0);
+        if (n <= 0) break;
+        line.push_back(c);
+        if (prev == '\r' && c == '\n') break;
+        prev = c;
+    }
     closesocket(s);
-    if (nr <= 0) return false;
-    std::string resp(buf, nr);
-    return resp.find("HTTP") != std::string::npos;
+    unsigned short code = 0;
+    if (!parse_status_line(line, code)) return fail;
+    return classify(code, set);
 }
 
 // ----------------------------------------------------------------------------
@@ -777,214 +1019,6 @@ static CompConfig read_config(const fs::path& dir) {
 }
 
 // ----------------------------------------------------------------------------
-// 组件描述表 (与 Rust model::Kind / StatusSet / ComponentDef / COMPONENTS 对齐)
-// ----------------------------------------------------------------------------
-enum class Kind { Node, Prunsrv };
-
-// spec §5: 不设"非 5xx 即活"的宽泛规则。
-struct StatusSet {
-    bool two, three, four_zero_four;
-    bool accepts(unsigned short code) const {
-        if (two && code >= 200 && code < 300) return true;
-        if (three && code >= 300 && code < 400) return true;
-        if (four_zero_four && code == 404) return true;
-        return false;
-    }
-};
-static const StatusSet SS_WEB     = { true, true, false };
-static const StatusSet SS_GATEWAY = { true, true, true  };
-
-struct ComponentDef {
-    const char*   key;
-    Kind          kind;
-    const wchar_t* rel_dir;
-    const wchar_t* present_marker;
-    const wchar_t* default_svc;
-    unsigned short default_port;
-    const wchar_t* default_pathname;
-    StatusSet     l2_ok;
-    unsigned      start_timeout_secs;
-};
-
-// 顺序即修复顺序: 网关先于 web/portal。
-static const ComponentDef COMPONENTS[3] = {
-    { "artemis", Kind::Prunsrv, L"bin\\artemis", L"bin\\windows\\artemis.exe",
-      L"artemis", 9016, L"/artemis", SS_GATEWAY, 90 },
-    { "artemis-web", Kind::Node, L"bin\\artemis-web\\artemis-web", L"koa-app.js",
-      L"artemis-web", 9017, L"/artemis-web", SS_WEB, 60 },
-    { "artemis-portal", Kind::Node, L"bin\\artemis-portal\\artemis-portal", L"koa-app.js",
-      L"artemis-portal", 9018, L"/artemis-portal", SS_WEB, 60 },
-};
-
-struct ResolvedComponent {
-    const ComponentDef* def;
-    fs::path              dir;
-    std::wstring          svc_name;
-    unsigned short        port;
-    std::wstring          pathname;
-    bool                  present;
-    std::vector<std::string> warnings;
-};
-
-static std::string read_file_narrow(const fs::path& p) {
-    std::ifstream f(p, std::ios::binary);
-    if (!f) return std::string();
-    return std::string((std::istreambuf_iterator<char>(f)),
-                       std::istreambuf_iterator<char>());
-}
-
-// 把 "set KEY=VALUE" 归一成 properties 行后复用 parse_properties。
-// 循环内不得早退, 首个不匹配行必须继续扫描。
-static bool parse_server_name_from_bat(const std::string& text, std::string& out) {
-    std::string props;
-    size_t pos = 0;
-    while (pos <= text.size()) {
-        size_t nl = text.find('\n', pos);
-        std::string raw = (nl == std::string::npos) ? text.substr(pos)
-                                                    : text.substr(pos, nl - pos);
-        pos = (nl == std::string::npos) ? text.size() + 1 : nl + 1;
-        if (!raw.empty() && raw.back() == '\r') raw.pop_back();
-        size_t b = raw.find_first_not_of(" \t");
-        if (b == std::string::npos) continue;
-        std::string t = raw.substr(b);
-        if (t.compare(0, 4, "set ") != 0) continue;
-        props += t.substr(4);
-        props += '\n';
-    }
-    std::map<std::string, std::string> m = parse_properties(props);
-    std::map<std::string, std::string>::iterator it = m.find("_ServerName");
-    if (it == m.end()) return false;
-    std::string v = it->second;
-    while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
-    // 等价于 Rust 的 trim_matches('"'): 两端引号成对或单个都要去掉
-    while (v.size() >= 2 && v.front() == '"' && v.back() == '"')
-        v = v.substr(1, v.size() - 2);
-    if (v.empty()) return false;
-    out = v;
-    return true;
-}
-
-static std::map<std::string, std::string> props_for(const ComponentDef& def,
-                                                    const fs::path& dir) {
-    const wchar_t* name = (def.kind == Kind::Node) ? L"config.properties"
-                                                   : L"application.properties";
-    return parse_properties(read_file_narrow(dir / name));
-}
-
-// 读配置得到 svc/port/pathname; 任一失败则用兜底值并记 Warn (spec §5)。
-static ResolvedComponent resolve_component(const ComponentDef& def, const fs::path& root) {
-    ResolvedComponent c;
-    c.def = &def;
-    c.dir = root / def.rel_dir;
-    std::map<std::string, std::string> p = props_for(def, c.dir);
-
-    if (def.kind == Kind::Prunsrv) {
-        std::string bat = read_file_narrow(c.dir / L"bin" / L"__service.bat");
-        std::string nm;
-        if (!bat.empty() && parse_server_name_from_bat(bat, nm)) {
-            c.svc_name = ascii_value_to_wide(nm);
-        } else {
-            c.warnings.push_back(std::string("未读到 _ServerName, 用兜底服务名 ") + def.key);
-            c.svc_name = def.default_svc;
-        }
-    } else {
-        std::map<std::string, std::string>::iterator it = p.find("service.name");
-        if (it != p.end() && !it->second.empty()) {
-            c.svc_name = ascii_value_to_wide(it->second);
-        } else {
-            c.warnings.push_back(std::string("未读到 service.name, 用兜底服务名 ") + def.key);
-            c.svc_name = def.default_svc;
-        }
-    }
-
-    std::map<std::string, std::string>::iterator pit = p.find("server.port");
-    bool port_ok = false;
-    c.port = def.default_port;
-    if (pit != p.end()) {
-        const std::string& s = pit->second;
-        port_ok = !s.empty();
-        for (char ch : s) if (ch < '0' || ch > '9') { port_ok = false; break; }
-        if (port_ok) {
-            unsigned long pv = std::strtoul(s.c_str(), nullptr, 10);
-            port_ok = (pv > 0 && pv <= 65535);
-            if (port_ok) c.port = (unsigned short)pv;
-        }
-    }
-    if (!port_ok) {
-        char buf[96];
-        snprintf(buf, sizeof(buf), "未读到 server.port, 用兜底端口 %u", def.default_port);
-        c.warnings.push_back(buf);
-    }
-
-    const char* key = (def.kind == Kind::Prunsrv) ? "server.context-path" : "server.pathname";
-    std::map<std::string, std::string>::iterator tit = p.find(key);
-    if (tit != p.end() && !tit->second.empty()) {
-        std::string path = tit->second;
-        while (path.size() > 1 && path.back() == '/') path.pop_back();  // 等价 trim_end_matches('/')
-        c.pathname = ascii_value_to_wide(path);
-    } else {
-        c.pathname = def.default_pathname;
-        c.warnings.push_back(std::string("未读到 ") + key + ", 用兜底路径 "
-                             + ws2utf8(std::wstring(def.default_pathname)));
-    }
-
-    std::error_code ec;
-    c.present = fs::is_regular_file(c.dir / def.present_marker, ec);
-    return c;
-}
-
-// ----------------------------------------------------------------------------
-// 三层探针结果与归因矩阵 (与 Rust model::L1/L2/L3/attribute 对齐, spec §6)
-// ----------------------------------------------------------------------------
-enum class L1 { Listening, NotListening };
-
-enum class L2Kind { Ok, ServerError, Unexpected, NoHttpResponse };
-struct L2 {
-    L2Kind kind;
-    unsigned short code;  // NoHttpResponse 时无意义
-};
-
-enum class L3Kind { Ok, Bad, TlsUnavailable, NginxDown, Skipped };
-struct L3 {
-    L3Kind kind;
-    unsigned short code;  // 仅 Ok/Bad 有意义
-};
-
-enum class VerdictAction { None_, RepairBackend, ReportOccupier, ShowLog, NginxAttrib, Unverifiable };
-
-struct RouteVerdict {
-    const char*   cause;
-    VerdictAction action;
-    unsigned char exit_contrib;  // 0/1/3
-};
-
-// 首次匹配, 顺序即优先级 (与 Rust 的 match 臂顺序逐条对应)。
-// Rust 的 Option<L2>/Option<L3> 在此用 has2/has3 表达。
-static RouteVerdict attribute(L1 l1, bool has2, L2 l2, bool has3, L3 l3) {
-    if (l1 == L1::NotListening)
-        return { "后端未监听端口", VerdictAction::RepairBackend, 1 };
-    // 行3 端口被非 HTTP 进程占用
-    if (has2 && l2.kind == L2Kind::NoHttpResponse)
-        return { "端口已被非 HTTP 进程占用", VerdictAction::ReportOccupier, 1 };
-    // 行4 5xx
-    if (has2 && l2.kind == L2Kind::ServerError)
-        return { "应用已启动但返回 5xx", VerdictAction::ShowLog, 1 };
-    // 行7 非期望状态码
-    if (has2 && l2.kind == L2Kind::Unexpected)
-        return { "后端响应不符合期望状态码", VerdictAction::RepairBackend, 1 };
-    // 行5/6 后端健康但转发层故障
-    if (has2 && l2.kind == L2Kind::Ok && has3
-        && (l3.kind == L3Kind::Bad || l3.kind == L3Kind::NginxDown))
-        return { "后端健康, nginx 转发层故障", VerdictAction::NginxAttrib, 3 };
-    // Review Focus #4: TLS 不可用不得判成后端或 nginx 故障
-    if (has2 && l2.kind == L2Kind::Ok && has3 && l3.kind == L3Kind::TlsUnavailable)
-        return { "端到端无法验证 (TLS 层不可用)", VerdictAction::Unverifiable, 0 };
-    if (has2 && l2.kind == L2Kind::Ok)
-        return { "正常", VerdictAction::None_, 0 };
-    return { "后端未响应, 探针未取到结果", VerdictAction::RepairBackend, 1 };
-}
-
-// ----------------------------------------------------------------------------
 // nginx 配置只读解析 (与 Rust nginx::* 对齐, spec §7)
 // 不修改、不 reload、不递归展开 include。
 // ----------------------------------------------------------------------------
@@ -1021,42 +1055,8 @@ static std::string strip_comment(const std::string& line) {
     return (h == std::string::npos) ? line : line.substr(0, h);
 }
 
-static std::string ltrim(const std::string& s) {
-    size_t b = s.find_first_not_of(" \t");
-    return b == std::string::npos ? std::string() : s.substr(b);
-}
-static std::string rtrim(const std::string& s) {
-    size_t e = s.find_last_not_of(" \t");
-    return e == std::string::npos ? std::string() : s.substr(0, e + 1);
-}
-static std::string trim(const std::string& s) { return ltrim(rtrim(s)); }
 
-static std::vector<std::string> split_lines(const std::string& text) {
-    std::vector<std::string> out;
-    size_t pos = 0;
-    while (true) {
-        size_t nl = text.find('\n', pos);
-        if (nl == std::string::npos) {
-            if (pos < text.size()) out.push_back(text.substr(pos));
-            break;
-        }
-        out.push_back(text.substr(pos, nl - pos));
-        pos = nl + 1;
-    }
-    for (std::string& s : out)
-        if (!s.empty() && s.back() == '\r') s.pop_back();
-    return out;
-}
 
-static bool starts_with(const std::string& s, const char* p) {
-    size_t n = std::strlen(p);
-    return s.size() >= n && s.compare(0, n, p) == 0;
-}
-static bool is_all_digits(const std::string& s) {
-    if (s.empty()) return false;
-    for (char c : s) if (c < '0' || c > '9') return false;
-    return true;
-}
 
 static std::vector<Upstream> parse_upstreams(const std::string& text) {
     std::vector<Upstream> out;
@@ -1349,7 +1349,8 @@ static void repair_component(const char* name_utf8, const fs::path& root,
     if (check_only) {
         if (state == SvcState::Running) {
             bool up = port_listening(port);
-            bool http = http_up(port, name_utf8);
+            L2 hp = http_probe_against(port, std::string("/") + name_utf8, SS_WEB);
+            bool http = (hp.kind == L2Kind::Ok);
             const char* st = (up && http) ? "端口监听, HTTP 正常"
                              : (up ? "端口监听, HTTP 异常" : "端口未监听");
             if (up && http) {
@@ -1410,7 +1411,8 @@ static void repair_component(const char* name_utf8, const fs::path& root,
         }
         std::this_thread::sleep_for(std::chrono::seconds(5));
     }
-    bool http = ok && http_up(port, name_utf8);
+    L2 hp = http_probe_against(port, std::string("/") + name_utf8, SS_WEB);
+    bool http = ok && (hp.kind == L2Kind::Ok);
 
     if (ok && http) {
         logf(Level::Ok,

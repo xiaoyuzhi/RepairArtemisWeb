@@ -34,8 +34,7 @@ mod probe;
 use std::env;
 use std::ffi::c_void;
 use std::fs;
-use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -232,69 +231,6 @@ fn run_node_logged(node_exe: &Path, script: &Path, cwd: Option<&Path>, prefix: &
     }
 }
 
-// --------------------------- 端口 / HTTP 检查 ------------------------------
-/// 用 netstat 判断本地端口是否处于 LISTENING (兼容中/英文输出)。
-fn port_netstat(port: u16) -> bool {
-    let (_c, out, _e) = run_output("netstat", &["-ano"], None);
-    for line in out.lines() {
-        let mut toks = line.split_whitespace();
-        let _proto = toks.next();
-        let Some(local) = toks.next() else { continue };
-        let Some(idx) = local.rfind(':') else { continue };
-        let Ok(p) = local[idx + 1..].trim_end_matches(']').parse::<u16>() else {
-            continue;
-        };
-        if p != port {
-            continue;
-        }
-        if toks.clone().any(|t| t.contains("LISTENING") || t.contains("LISTEN")) {
-            return true;
-        }
-    }
-    false
-}
-
-/// 端口监听判定: netstat 优先, TCP 连通测试兜底 (防止状态字被本地化)。
-fn port_listening(port: u16) -> bool {
-    if port_netstat(port) {
-        return true;
-    }
-    let addr: SocketAddr = match format!("127.0.0.1:{}", port).parse() {
-        Ok(a) => a,
-        Err(_) => return false,
-    };
-    TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
-}
-
-/// HTTP 健康检查: 只要求有 HTTP 响应 (200/302/404 均算服务已起), 连接拒绝才算失败。
-fn http_up(port: u16, pathname: &str) -> bool {
-    let addr: SocketAddr = match format!("127.0.0.1:{}", port).parse() {
-        Ok(a) => a,
-        Err(_) => return false,
-    };
-    let mut s = match TcpStream::connect_timeout(&addr, Duration::from_secs(8)) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let _ = s.set_read_timeout(Some(Duration::from_secs(8)));
-    let _ = s.set_write_timeout(Some(Duration::from_secs(8)));
-    let req = format!(
-        "GET /{}/ HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nUser-Agent: RepairArtemisWeb\r\nConnection: close\r\n\r\n",
-        pathname, port
-    );
-    if s.write_all(req.as_bytes()).is_err() {
-        return false;
-    }
-    if s.flush().is_err() {
-        return false;
-    }
-    let mut buf = [0u8; 512];
-    match s.read(&mut buf) {
-        Ok(n) if n > 0 => buf[..n].windows(4).any(|w| w == b"HTTP"),
-        _ => false,
-    }
-}
-
 // ------------------------------ 服务管理 (sc.exe) --------------------------
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SvcState {
@@ -382,7 +318,14 @@ fn find_node_exe(base: &Path) -> Option<PathBuf> {
         };
         for e in rd.flatten() {
             let p = e.path();
-            let ft = e.file_type().unwrap_or(p.metadata().map(|m| m.file_type()).ok()?);
+            let ft = match e.file_type() {
+                Ok(t) => t,
+                Err(_) => match p.metadata() {
+                    Ok(m) => m.file_type(),
+                    // 单个条目读不出类型就跳过, 不得中断整棵树的查找
+                    Err(_) => continue,
+                },
+            };
             if ft.is_dir() {
                 stack.push(p);
             } else if p
@@ -504,8 +447,11 @@ fn repair_component(
     if check_only {
         match state {
             SvcState::Running => {
-                let up = port_listening(port);
-                let http = http_up(port, name);
+                let up = probe::port_listening(port);
+                let http = matches!(
+                    probe::http_probe_against(port, &format!("/{}", name), &model::StatusSet::WEB),
+                    model::L2::Ok(_)
+                );
                 let st = if up && http {
                     "端口监听, HTTP 正常"
                 } else if up {
@@ -540,7 +486,7 @@ fn repair_component(
         start_service(&svc_name);
         thread::sleep(Duration::from_secs(5));
         state = service_state(&svc_name);
-        if state == SvcState::Running && port_listening(port) {
+        if state == SvcState::Running && probe::port_listening(port) {
             log(Level::Ok, &format!("启动成功, 端口 {} 已监听。", port));
         } else {
             log(Level::Warn, "直接启动失败或端口未监听, 转入重装流程。");
@@ -570,13 +516,17 @@ fn repair_component(
     // 等待端口监听 (最多 60 秒)
     let mut ok = false;
     for _ in 0..12 {
-        if port_listening(port) {
+        if probe::port_listening(port) {
             ok = true;
             break;
         }
         thread::sleep(Duration::from_secs(5));
     }
-    let http = ok && http_up(port, name);
+    let http = ok
+        && matches!(
+            probe::http_probe_against(port, &format!("/{}", name), &model::StatusSet::WEB),
+            model::L2::Ok(_)
+        );
 
     if ok && http {
         log(
@@ -662,7 +612,7 @@ fn run_flow(action: Action, root_arg: Option<String>) -> i32 {
         (443, "nginx"),
     ];
     for (p, desc) in PREREQ {
-        if port_listening(*p) {
+        if probe::port_listening(*p) {
             log(Level::Ok, &format!("{} 端口 {}: 正常监听", desc, p));
         } else {
             log(
@@ -853,4 +803,30 @@ fn main() {
     let code = run_flow(action, root_arg);
     pause_if_console();
     std::process::exit(code);
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_exe取字典序最大者并递归遍历子树() {
+        let dir = std::env::temp_dir().join(format!("raw_t6_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        // 用 join 链构造路径, 避免字面量里的反斜杠被当成转义序列
+        let a = dir.join("a").join("node-v10-win-x64");
+        let b = dir.join("b").join("node-v14-win-x64");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("node.exe"), b"x").unwrap();
+        fs::write(b.join("node.exe"), b"x").unwrap();
+        assert_eq!(find_node_exe(&dir), Some(b.join("node.exe")));
+        // 目录里一个 node.exe 都没有时必须返回 None, 而不是 panic
+        let bare = std::env::temp_dir().join(format!("raw_t6b_{}", std::process::id()));
+        fs::create_dir_all(&bare).unwrap();
+        assert_eq!(find_node_exe(&bare), None);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&bare);
+    }
 }
