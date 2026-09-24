@@ -919,10 +919,6 @@ static bool find_node_exe(const fs::path& base, fs::path& out) {
 // ----------------------------------------------------------------------------
 // config.properties 解析
 // ----------------------------------------------------------------------------
-struct CompConfig {
-    std::optional<std::wstring> service_name;
-    std::optional<unsigned short> port;
-};
 
 static std::string trim_ws(const std::string& s) {
     size_t b = 0, e = s.size();
@@ -1033,57 +1029,6 @@ static const char* classify_log(const std::string& text) {
     return nullptr;
 }
 
-static CompConfig read_config(const fs::path& dir) {
-    CompConfig cfg;
-    std::ifstream f(dir / L"config.properties", std::ios::binary);
-    if (!f) return cfg;
-    std::string content((std::istreambuf_iterator<char>(f)),
-                        std::istreambuf_iterator<char>());
-    // 去掉 UTF-8 BOM
-    if (content.size() >= 3 && (unsigned char)content[0] == 0xEF &&
-        (unsigned char)content[1] == 0xBB && (unsigned char)content[2] == 0xBF) {
-        content = content.substr(3);
-    }
-    size_t pos = 0;
-    while (pos <= content.size()) {
-        size_t nl = content.find('\n', pos);
-        std::string line = (nl == std::string::npos) ? content.substr(pos)
-                                                     : content.substr(pos, nl - pos);
-        pos = (nl == std::string::npos) ? content.size() + 1 : nl + 1;
-        if (line.find('\r') != std::string::npos) line.pop_back();
-        line = trim_ws(line);
-        if (line.empty() || line[0] == '#' || line[0] == '!') continue;
-
-        // 按 ASCII 键精确匹配 service.name / server.port
-        const char* keys[] = { "service.name", "server.port" };
-        for (int ki = 0; ki < 2; ++ki) {
-            const char* key = keys[ki];
-            size_t klen = std::strlen(key);
-            if (line.compare(0, klen, key) != 0) continue;
-            // 键后必须是 '=' (允许中间空白)
-            size_t eq = line.find('=');
-            if (eq == std::string::npos) continue;
-            std::string kpart = trim_ws(line.substr(0, eq));
-            if (kpart != key) continue;
-            std::string vpart = trim_ws(line.substr(eq + 1));
-            // 只取第一个 token
-            size_t sp = vpart.find_first_of(" \t");
-            if (sp != std::string::npos) vpart = vpart.substr(0, sp);
-            if (vpart.empty()) continue;
-            if (ki == 0 && !cfg.service_name) {
-                cfg.service_name = ascii_value_to_wide(vpart);
-            } else if (ki == 1 && !cfg.port) {
-                bool dig = !vpart.empty();
-                for (char c : vpart) if (c < '0' || c > '9') { dig = false; break; }
-                if (dig) {
-                    unsigned long p = std::strtoul(vpart.c_str(), nullptr, 10);
-                    if (p > 0 && p <= 65535) cfg.port = (unsigned short)p;
-                }
-            }
-        }
-    }
-    return cfg;
-}
 
 // ----------------------------------------------------------------------------
 // nginx 配置只读解析 (与 Rust nginx::* 对齐, spec §7)
@@ -1352,153 +1297,234 @@ static bool locate_nginx_conf(const fs::path& base, fs::path& out) {
 }
 
 // ----------------------------------------------------------------------------
+// 修复阶梯决策 (与 Rust main::RepairStep / plan_repair 对齐, spec §6)
+// ----------------------------------------------------------------------------
+enum class RepairStep {
+    ScStart, ScStop, ScDelete,
+    NodeUninstall, NodeInstall,
+    PrunsrvInstall, PrunsrvReinstall, PrunsrvRestart,
+};
+
+// 纯函数: 网关比 node 保守一级 (D2)。
+static std::vector<RepairStep> plan_repair(Kind kind, SvcState state,
+                                           bool l1_up, bool reinstall) {
+    std::vector<RepairStep> v;
+    if (kind == Kind::Node) {
+        if (state == SvcState::Running && l1_up && !reinstall) return v;
+        if (state == SvcState::Stopped) {
+            v.push_back(RepairStep::ScStart);
+        } else {
+            v.push_back(RepairStep::NodeUninstall);
+            v.push_back(RepairStep::ScStop);
+            v.push_back(RepairStep::ScDelete);
+            v.push_back(RepairStep::NodeInstall);
+            v.push_back(RepairStep::ScStart);
+        }
+        return v;
+    }
+    // Prunsrv: --reinstall 只是"端口起不来时才升级到重装", 不能拿它去重装健康的网关
+    if (state == SvcState::Running && l1_up) return v;
+    if (state == SvcState::Missing) {
+        v.push_back(RepairStep::PrunsrvInstall);
+        v.push_back(RepairStep::ScStart);
+    } else if (state == SvcState::Stopped) {
+        v.push_back(RepairStep::ScStart);
+    } else {
+        v.push_back(RepairStep::PrunsrvRestart);
+        if (reinstall) v.push_back(RepairStep::PrunsrvReinstall);
+    }
+    return v;
+}
+
+// ----------------------------------------------------------------------------
 // 修复流程
 // ----------------------------------------------------------------------------
-static void print_wrapper_tail(const fs::path& comp_dir,
-                               const std::wstring& svc_name) {
-    fs::path wrapper = comp_dir / L"daemon" / (svc_name + L".wrapper.log");
+// 跑 __service.bat {install|restart|uninstall}; 脚本自身会 CD 到 bin/artemis。
+static void run_prunsrv_bat(const fs::path& dir, const wchar_t* verb,
+                            const std::string& prefix) {
+    fs::path bat = dir / L"bin" / L"__service.bat";
     std::error_code ec;
-    if (!fs::is_regular_file(wrapper, ec)) return;
-    std::ifstream f(wrapper, std::ios::binary);
-    if (!f) return;
-    std::string content((std::istreambuf_iterator<char>(f)),
-                        std::istreambuf_iterator<char>());
-    std::vector<std::string> lines;
-    size_t p = 0;
-    while (p <= content.size()) {
-        size_t nl = content.find('\n', p);
-        std::string line = (nl == std::string::npos) ? content.substr(p)
-                                                     : content.substr(p, nl - p);
-        p = (nl == std::string::npos) ? content.size() + 1 : nl + 1;
-        while (!line.empty() && line.back() == '\r') line.pop_back();
-        lines.push_back(line);
+    if (!fs::is_regular_file(bat, ec)) {
+        logf(Level::Err, "未找到 %s", decode_to_utf8(bat.native()).c_str());
+        return;
     }
-    if (lines.empty()) return;
-    log(Level::Err, "--- wrapper.log 最后 10 行 ---");
-    size_t start = lines.size() > 10 ? lines.size() - 10 : 0;
-    for (size_t i = start; i < lines.size(); ++i) {
-        if (!lines[i].empty()) {
-            log(Level::Err, "  " + decode_to_utf8(lines[i]));
-        }
+    RunRes r = run_output(L"cmd.exe", { L"/C", bat.native(), verb }, nullptr);
+    if (!r.launched) {
+        logf(Level::Err, "无法执行 %s", decode_to_utf8(bat.native()).c_str());
+        return;
     }
+    std::string text = decode_to_utf8(r.out);
+    for (const std::string& line : split_lines(text)) {
+        std::string t = trim(line);
+        if (!t.empty()) logf(Level::Info, "  [%s] %s", prefix.c_str(), t.c_str());
+    }
+    if (r.exitCode != 0) logf(Level::Warn, "  [%s] 退出码 %ld", prefix.c_str(), r.exitCode);
 }
 
-// 组件名 / 服务名 / 端口 (utf8 输出用)
-static void repair_component(const char* name_utf8, const fs::path& root,
-                             const fs::path& node_exe, bool reinstall,
-                             bool check_only, unsigned int& issues) {
-    fs::path comp_dir = root / L"bin" / name_utf8 / name_utf8;
-    fs::path install_js = comp_dir / L"service.install.js";
-    fs::path uninstall_js = comp_dir / L"service.uninstall.js";
-
-    log(Level::Step, std::string("---- 组件 [") + name_utf8 + "] ----");
-    std::error_code ec;
-    if (!fs::is_regular_file(comp_dir / L"koa-app.js", ec)) {
-        logf(Level::Err, "组件目录不存在或缺文件: %s",
-             decode_to_utf8(comp_dir.native()).c_str());
-        ++issues;
-        return;
-    }
-
-    CompConfig cfg = read_config(comp_dir);
-    std::wstring svc_name = cfg.service_name ? *cfg.service_name
-                                             : ascii_value_to_wide(name_utf8);
-    unsigned short port = cfg.port ? *cfg.port
-                                   : (std::strcmp(name_utf8, "artemis-portal") == 0
-                                          ? 9018
-                                          : 9017);
-    logf(Level::Info, "服务名=%s 端口=%u", decode_to_utf8(svc_name).c_str(),
-         (unsigned)port);
-
-    SvcState state = service_state(svc_name);
-
-    // ---- 仅检查 ----
-    if (check_only) {
-        if (state == SvcState::Running) {
-            bool up = port_listening(port);
-            L2 hp = http_probe_against(port, std::string("/") + name_utf8, SS_WEB);
-            bool http = (hp.kind == L2Kind::Ok);
-            const char* st = (up && http) ? "端口监听, HTTP 正常"
-                             : (up ? "端口监听, HTTP 异常" : "端口未监听");
-            if (up && http) {
-                logf(Level::Ok, "服务运行中, %s", st);
-            } else {
-                logf(Level::Err, "服务运行中, %s", st);
-                ++issues;
-            }
-        } else {
-            const char* st = (state == SvcState::Missing) ? "未安装" : "其他状态";
-            logf(Level::Err, "服务未运行 (Status=%s)", st);
-            ++issues;
-        }
-        return;
-    }
-
-    // ---- 修复 ----
-    bool need_reinstall = reinstall || state == SvcState::Missing;
-
-    if (!need_reinstall && state != SvcState::Running) {
-        log(Level::Info, "服务存在但未运行, 先尝试直接启动...");
-        start_service(svc_name);
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-        state = service_state(svc_name);
-        if (state == SvcState::Running && port_listening(port)) {
-            logf(Level::Ok, "启动成功, 端口 %u 已监听。", (unsigned)port);
-        } else {
-            log(Level::Warn, "直接启动失败或端口未监听, 转入重装流程。");
-            need_reinstall = true;
-        }
-    }
-
-    if (need_reinstall) {
-        if (state != SvcState::Missing) {
-            logf(Level::Info, "卸载旧服务 %s ...", decode_to_utf8(svc_name).c_str());
-            run_node_logged(node_exe, uninstall_js, nullptr, "uninstall");
-            stop_service(svc_name);
-            delete_service(svc_name);
-            std::this_thread::sleep_for(std::chrono::seconds(3));
-        }
-        log(Level::Info, "重装服务 (重建 daemon 守护进程)...");
-        run_node_logged(node_exe, install_js, &comp_dir, "install");
-
-        // service.install.js 安装后通常会自动 start, 这里再兜底启动一次
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-        SvcState st = service_state(svc_name);
-        if (st != SvcState::Missing && st != SvcState::Running) {
-            start_service(svc_name);
-        }
-    }
-
-    // 等待端口监听 (最多 60 秒)
-    bool ok = false;
-    for (int i = 0; i < 12; ++i) {
-        if (port_listening(port)) {
-            ok = true;
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-    }
-    L2 hp = http_probe_against(port, std::string("/") + name_utf8, SS_WEB);
-    bool http = ok && (hp.kind == L2Kind::Ok);
-
-    if (ok && http) {
-        logf(Level::Ok,
-             "[%s] 修复成功: 服务运行中, 端口 %u 监听, HTTP 响应正常。",
-             name_utf8, (unsigned)port);
-    } else if (ok) {
-        logf(Level::Warn,
-             "[%s] 端口 %u 已监听, 但 HTTP 检查未通过 (可能仍在初始化, 稍后刷新页面确认)。",
-             name_utf8, (unsigned)port);
-        ++issues;
+// spec §8: 失败时按 kind tail 正确的日志文件, 并给特征归因结论。
+static void dump_component_logs(const ResolvedComponent& rc) {
+    std::vector<fs::path> files;
+    if (rc.def->kind == Kind::Node) {
+        fs::path d = rc.dir / L"daemon";
+        files.push_back(d / (rc.svc_name + L".err.log"));
+        files.push_back(d / (rc.svc_name + L".out.log"));
+        files.push_back(d / (rc.svc_name + L".wrapper.log"));
+        std::map<std::string, std::string> p =
+            parse_properties(read_file_narrow(rc.dir / L"config.properties"));
+        std::map<std::string, std::string>::iterator it = p.find("log.path");
+        if (it != p.end() && !it->second.empty())
+            files.push_back(rc.dir / ascii_value_to_wide(it->second));
     } else {
-        logf(Level::Err,
-             "[%s] 修复失败: 端口 %u 未监听。请查看 daemon\\wrapper.log 与 log.txt。",
-             name_utf8, (unsigned)port);
-        print_wrapper_tail(comp_dir, svc_name);
-        ++issues;
+        fs::path d = rc.dir / L"logs";
+        std::error_code ec;
+        if (fs::is_directory(d, ec)) {
+            for (const auto& e : fs::directory_iterator(d, ec)) {
+                fs::path p = e.path();
+                fs::path leaf = p.filename();
+                if (leaf.native().compare(0, 7, L"artemis") == 0) files.push_back(p);
+            }
+        }
     }
+    std::string all;
+    for (const fs::path& f : files) {
+        std::error_code ec;
+        if (!fs::is_regular_file(f, ec)) continue;
+        std::string s;
+        if (!tail_file(f, TAIL_LIMIT_BYTES, s)) continue;
+        logf(Level::Err, "--- %s (尾部 %lluB) ---",
+             decode_to_utf8(f.filename().native()).c_str(),
+             (unsigned long long)s.size());
+        std::vector<std::string> lines = split_lines(s);
+        size_t start = lines.size() > 10 ? lines.size() - 10 : 0;
+        for (size_t i = start; i < lines.size(); ++i) {
+            logf(Level::Err, "  %s", decode_to_utf8(lines[i]).c_str());
+        }
+        all += s;
+    }
+    const char* why = classify_log(all);
+    if (why) logf(Level::Err, "日志特征归因: %s", why);
+    else     log(Level::Info, "日志未命中已知故障特征。");
 }
 
+// 等到端口监听为止, 上限为该组件的 start_timeout。
+static bool wait_for_port(const ResolvedComponent& rc) {
+    unsigned long long waited = 0;
+    unsigned long long deadline = rc.def->start_timeout_secs;
+    while (waited < deadline) {
+        if (port_listening(rc.port)) return true;
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        waited += 5;
+    }
+    return port_listening(rc.port);
+}
+
+// 交互确认; 非交互 (stdin 非控制台) 时一律 false, 不做危险动作。
+static bool confirm(const std::string& prompt) {
+    if (!stdin_is_console()) return false;
+    std::printf("%s ", prompt.c_str());
+    std::fflush(stdout);
+    std::string line;
+    if (!std::getline(std::cin, line)) return false;
+    std::string k = trim(line);
+    for (size_t i = 0; i < k.size(); ++i) k[i] = (char)std::tolower((unsigned char)k[i]);
+    return k == "y" || k == "yes";
+}
+
+// 返回该组件对异常计数的贡献: 0 正常, 1 异常, 3 nginx 层。
+static int repair_component(const ResolvedComponent& rc, const fs::path& node_exe,
+                            bool reinstall, bool check_only, bool assume_yes,
+                            unsigned int& issues) {
+    log(Level::Step, std::string("---- 组件 [") + rc.def->key + "] ----");
+    if (!rc.present) {
+        logf(Level::Err, "组件不存在: %s",
+             decode_to_utf8((rc.dir / rc.def->present_marker).native()).c_str());
+        ++issues;
+        return 1;
+    }
+    for (const std::string& w : rc.warnings) log(Level::Warn, w);
+
+    SvcState state = service_state(rc.svc_name);
+    bool l1 = port_listening(rc.port);
+    logf(Level::Info, "服务名=%s 端口=%u 状态=%d L1=%d",
+         decode_to_utf8(rc.svc_name).c_str(), rc.port, (int)state, l1 ? 1 : 0);
+
+    L2 noresp; noresp.kind = L2Kind::NoHttpResponse; noresp.code = 0;
+    L3 nol3;   nol3.kind = L3Kind::TlsUnavailable;   nol3.code = 0;
+
+    if (check_only) {
+        L2 l2 = l1 ? http_probe_against(rc.port, ws2utf8(rc.pathname), rc.def->l2_ok)
+                   : noresp;
+        RouteVerdict v = attribute(l1 ? L1::Listening : L1::NotListening,
+                                   l1, l2, false, nol3);
+        log(v.exit_contrib == 0 ? Level::Ok : Level::Err, v.cause);
+        issues += v.exit_contrib;
+        return v.exit_contrib;
+    }
+
+    // spec §6 步骤 3: 服务在跑但端口未起, 先等到 start_timeout, 别急着 restart
+    if (state == SvcState::Running && !l1) {
+        logf(Level::Info, "服务运行中但端口未监听, 等待至 %llu 秒 ...",
+             (unsigned long long)rc.def->start_timeout_secs);
+        l1 = wait_for_port(rc);
+    }
+
+    std::vector<RepairStep> steps = plan_repair(rc.def->kind, state, l1, reinstall);
+    if (steps.empty()) {
+        log(Level::Ok, "无需修复。");
+        return 0;
+    }
+    if (rc.def->kind == Kind::Prunsrv) {
+        bool wants_reinstall = false;
+        for (RepairStep s : steps)
+            if (s == RepairStep::PrunsrvReinstall) wants_reinstall = true;
+        if (wants_reinstall && !assume_yes
+            && !confirm("即将卸载并重装 Java 网关服务 "
+                        + decode_to_utf8(rc.svc_name)
+                        + " (影响整个 OpenAPI 平台), 确认? [y/N]")) {
+            log(Level::Warn, "用户取消网关重装。");
+            ++issues;
+            return 1;
+        }
+    }
+
+    for (RepairStep s : steps) {
+        switch (s) {
+            case RepairStep::ScStart:
+                logf(Level::Info, "sc start %s", decode_to_utf8(rc.svc_name).c_str());
+                start_service(rc.svc_name);
+                break;
+            case RepairStep::ScStop:   stop_service(rc.svc_name); break;
+            case RepairStep::ScDelete: delete_service(rc.svc_name); break;
+            case RepairStep::NodeUninstall:
+                run_node_logged(node_exe, rc.dir / L"service.uninstall.js", nullptr, "uninstall");
+                break;
+            case RepairStep::NodeInstall:
+                run_node_logged(node_exe, rc.dir / L"service.install.js", &rc.dir, "install");
+                break;
+            case RepairStep::PrunsrvInstall: run_prunsrv_bat(rc.dir, L"install", "prunsrv"); break;
+            case RepairStep::PrunsrvRestart: run_prunsrv_bat(rc.dir, L"restart", "prunsrv"); break;
+            case RepairStep::PrunsrvReinstall:
+                run_prunsrv_bat(rc.dir, L"uninstall", "prunsrv");
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+                run_prunsrv_bat(rc.dir, L"install", "prunsrv");
+                break;
+        }
+    }
+
+    if (!port_listening(rc.port) && !wait_for_port(rc)) {
+        logf(Level::Err, "[%s] 修复失败: 端口 %u 未监听。", rc.def->key, rc.port);
+        dump_component_logs(rc);
+        ++issues;
+        return 1;
+    }
+    L2 l2 = http_probe_against(rc.port, ws2utf8(rc.pathname), rc.def->l2_ok);
+    RouteVerdict v = attribute(L1::Listening, true, l2, false, nol3);
+    log(v.exit_contrib == 0 ? Level::Ok : Level::Warn,
+        std::string("[") + rc.def->key + "] 端口 " + std::to_string(rc.port)
+        + " 已监听; " + v.cause);
+    issues += v.exit_contrib;
+    return v.exit_contrib;
+}
 // ----------------------------------------------------------------------------
 // 主流程
 // ----------------------------------------------------------------------------
@@ -1563,8 +1589,11 @@ static int run_flow(Action action, const std::wstring& root_arg) {
     }
 
     // == 4. 组件修复 ==
-    repair_component("artemis-web", root, node, reinstall, check_only, issues);
-    repair_component("artemis-portal", root, node, reinstall, check_only, issues);
+    // Task 9 会按 --components 选项重组这一段, 这里先接上新的 resolve/repair 契约
+    for (const ComponentDef& def : COMPONENTS) {
+        ResolvedComponent rc = resolve_component(def, root);
+        repair_component(rc, node, reinstall, check_only, false, issues);
+    }
 
     // == 5. 汇总 ==
     log(Level::Step, "==== 汇总 ====");

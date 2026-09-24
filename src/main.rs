@@ -279,6 +279,50 @@ fn delete_service(name: &str) {
     run_status("sc.exe", &["delete", name]);
 }
 
+// ------------------------------ 修复阶梯决策 --------------------------------
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum RepairStep {
+    ScStart,
+    ScStop,
+    ScDelete,
+    NodeUninstall,
+    NodeInstall,
+    PrunsrvInstall,
+    PrunsrvReinstall,
+    PrunsrvRestart,
+}
+
+/// 纯函数: 输入 (kind, 服务状态, L1 是否监听, 是否 --reinstall), 输出阶梯。
+/// spec §6。网关比 node 保守一级 (D2)。
+fn plan_repair(kind: model::Kind, state: SvcState, l1_up: bool, reinstall: bool) -> Vec<RepairStep> {
+    use model::Kind::*;
+    use RepairStep::*;
+    match kind {
+        Node => {
+            if state == SvcState::Running && l1_up && !reinstall {
+                return Vec::new();
+            }
+            match state {
+                SvcState::Stopped => vec![ScStart],
+                _ => vec![NodeUninstall, ScStop, ScDelete, NodeInstall, ScStart],
+            }
+        }
+        Prunsrv => {
+            // spec §6 步骤 4: --reinstall 只是"端口起不来时允许升级到重装",
+            // 不能拿它去重装一个已经健康的网关 (D2 的保守一级正在这里)
+            if state == SvcState::Running && l1_up {
+                return Vec::new();
+            }
+            match state {
+                SvcState::Missing => vec![PrunsrvInstall, ScStart],
+                SvcState::Stopped => vec![ScStart],
+                _ if reinstall => vec![PrunsrvRestart, PrunsrvReinstall],
+                _ => vec![PrunsrvRestart],
+            }
+        }
+    }
+}
+
 // ------------------------------ 目录 / 文件定位 ----------------------------
 /// 在 base 下递归查找名为 artemis 的目录 (取第一个, 模拟 PS 枚举)。
 fn find_artemis_dir(base: &Path) -> Option<PathBuf> {
@@ -341,221 +385,238 @@ fn find_node_exe(base: &Path) -> Option<PathBuf> {
     found.into_iter().next()
 }
 
-// ------------------------------ config.properties --------------------------
-struct CompConfig {
-    service_name: Option<String>,
-    port: Option<u16>,
-}
-
-/// 解析 config.properties 中的 service.name / server.port
-/// (键中的 "." 在 PS 正则里是转义的字面点)。
-fn read_config(dir: &Path) -> CompConfig {
-    let mut cfg = CompConfig {
-        service_name: None,
-        port: None,
-    };
-    let raw = match fs::read(dir.join("config.properties")) {
-        Ok(b) => b,
-        Err(_) => return cfg,
-    };
-    let content = String::from_utf8_lossy(&raw).into_owned();
-    for line in content.lines() {
-        let line = line.trim_start();
-        if cfg.service_name.is_none() {
-            if let Some(rest) = line.strip_prefix("service.name") {
-                if let Some(v) = kv_value(rest) {
-                    cfg.service_name = Some(v);
-                }
-            }
-        }
-        if cfg.port.is_none() {
-            if let Some(rest) = line.strip_prefix("server.port") {
-                if let Some(v) = kv_value(rest) {
-                    cfg.port = v.parse::<u16>().ok();
-                }
-            }
-        }
-    }
-    cfg
-}
-
-/// 从 "= value ..." 剩余部分提取第一个非空白 token。
-fn kv_value(after_key: &str) -> Option<String> {
-    let rest = after_key.trim_start();
-    let rest = rest.strip_prefix('=')?.trim_start();
-    let v = rest.split_whitespace().next()?;
-    Some(v.to_string())
-}
-
 // --------------------------------- 修复流程 ---------------------------------
-fn print_wrapper_tail(comp_dir: &Path, svc_name: &str) {
-    let wrapper = comp_dir
-        .join("daemon")
-        .join(format!("{}.wrapper.log", svc_name));
-    if wrapper.is_file() {
-        log(Level::Err, "--- wrapper.log 最后 10 行 ---");
-        if let Ok(content) = fs::read_to_string(&wrapper) {
-            let lines: Vec<&str> = content.lines().collect();
-            let start = lines.len().saturating_sub(10);
-            for l in &lines[start..] {
-                log(Level::Err, &format!("  {}", l));
+
+/// 跑 `__service.bat {install|restart|uninstall}`。脚本自身会 CD 到 bin/artemis。
+fn run_prunsrv_bat(dir: &Path, verb: &str, prefix: &str) {
+    let bat = dir.join("bin").join("__service.bat");
+    if !bat.is_file() {
+        log(Level::Err, &format!("未找到 {}", bat.display()));
+        return;
+    }
+    let mut c = Command::new("cmd");
+    c.args(["/C", &bat.to_string_lossy(), verb]);
+    if let Ok(out) = c.output() {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for l in text.lines() {
+            if !l.trim().is_empty() {
+                log(Level::Info, &format!("  [{}] {}", prefix, l.trim_end()));
             }
+        }
+        let code = out.status.code().unwrap_or(-1);
+        if code != 0 {
+            log(Level::Warn, &format!("  [{}] 退出码 {}", prefix, code));
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// spec §8: 失败时按 kind tail 正确的日志文件, 并给特征归因结论。
+fn dump_component_logs(rc: &model::ResolvedComponent) {
+    let files: Vec<PathBuf> = match rc.def.kind {
+        model::Kind::Node => {
+            let d = rc.dir.join("daemon");
+            let mut v = vec![
+                d.join(format!("{}.err.log", rc.svc_name)),
+                d.join(format!("{}.out.log", rc.svc_name)),
+                d.join(format!("{}.wrapper.log", rc.svc_name)),
+            ];
+            if let Ok(t) = fs::read_to_string(rc.dir.join("config.properties")) {
+                if let Some(p) = model::parse_properties(&t).get("log.path").cloned() {
+                    v.push(rc.dir.join(p));
+                }
+            }
+            v
+        }
+        model::Kind::Prunsrv => {
+            let d = rc.dir.join("logs");
+            match fs::read_dir(&d) {
+                Ok(rd) => rd
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .map(|n| n.to_string_lossy().starts_with("artemis"))
+                            .unwrap_or(false)
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        }
+    };
+    let mut all = String::new();
+    for f in files.iter().filter(|p| p.is_file()) {
+        let b = match logs::tail_file(f, logs::TAIL_LIMIT_BYTES) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let s = String::from_utf8_lossy(&b).into_owned();
+        let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        log(Level::Err, &format!("--- {} (尾部 {}B) ---", name, b.len()));
+        let head: Vec<&str> = s.lines().rev().take(10).collect();
+        for l in head.into_iter().rev() {
+            log(Level::Err, &format!("  {}", l));
+        }
+        all.push_str(&s);
+    }
+    match logs::classify_log(&all) {
+        Some(why) => log(Level::Err, &format!("日志特征归因: {}", why)),
+        None => log(Level::Info, "日志未命中已知故障特征。"),
+    }
+}
+
+/// 等到端口监听为止, 上限为该组件的 start_timeout。
+fn wait_for_port(rc: &model::ResolvedComponent) -> bool {
+    let deadline = rc.def.start_timeout_secs;
+    let mut waited = 0u64;
+    while waited < deadline {
+        if probe::port_listening(rc.port) {
+            return true;
+        }
+        thread::sleep(Duration::from_secs(5));
+        waited += 5;
+    }
+    probe::port_listening(rc.port)
+}
+
+/// 交互确认; 非交互 (stdin 非控制台) 时一律返回 false, 不做危险动作。
+fn confirm(prompt: &str) -> bool {
+    if !stdin_is_console() {
+        return false;
+    }
+    print!("{} ", prompt);
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// 返回该组件对异常计数的贡献: 0 正常, 1 异常, 3 nginx 层。
 fn repair_component(
-    name: &str,
-    root: &Path,
+    rc: &model::ResolvedComponent,
     node_exe: &Path,
     reinstall: bool,
     check_only: bool,
+    assume_yes: bool,
     issues: &mut u32,
-) {
-    let comp_dir = root.join("bin").join(name).join(name);
-    let install_js = comp_dir.join("service.install.js");
-    let uninstall_js = comp_dir.join("service.uninstall.js");
-
-    log(Level::Step, &format!("---- 组件 [{}] ----", name));
-    if !comp_dir.join("koa-app.js").is_file() {
+) -> u8 {
+    log(Level::Step, &format!("---- 组件 [{}] ----", rc.def.key));
+    if !rc.present {
         log(
             Level::Err,
-            &format!("组件目录不存在或缺文件: {}", comp_dir.display()),
+            &format!("组件不存在: {}", rc.dir.join(rc.def.present_marker).display()),
         );
         *issues += 1;
-        return;
+        return 1;
     }
+    for w in &rc.warnings {
+        log(Level::Warn, w);
+    }
+    let state = service_state(&rc.svc_name);
+    let mut l1 = probe::port_listening(rc.port);
+    log(
+        Level::Info,
+        &format!(
+            "服务名={} 端口={} 状态={:?} L1={}",
+            rc.svc_name, rc.port, state, l1
+        ),
+    );
 
-    let cfg = read_config(&comp_dir);
-    let svc_name = cfg
-        .service_name
-        .clone()
-        .unwrap_or_else(|| name.to_string());
-    let port = cfg.port.unwrap_or_else(|| {
-        if name == "artemis-portal" {
-            9018
-        } else {
-            9017
-        }
-    });
-    log(Level::Info, &format!("服务名={} 端口={}", svc_name, port));
-
-    let mut state = service_state(&svc_name);
-
-    // ---- 仅检查 ----
     if check_only {
-        match state {
-            SvcState::Running => {
-                let up = probe::port_listening(port);
-                let http = matches!(
-                    probe::http_probe_against(port, &format!("/{}", name), &model::StatusSet::WEB),
-                    model::L2::Ok(_)
-                );
-                let st = if up && http {
-                    "端口监听, HTTP 正常"
-                } else if up {
-                    "端口监听, HTTP 异常"
-                } else {
-                    "端口未监听"
-                };
-                if up && http {
-                    log(Level::Ok, &format!("服务运行中, {}", st));
-                } else {
-                    log(Level::Err, &format!("服务运行中, {}", st));
-                    *issues += 1;
-                }
-            }
-            other => {
-                let st = match other {
-                    SvcState::Missing => "未安装".to_string(),
-                    s => format!("{:?}", s),
-                };
-                log(Level::Err, &format!("服务未运行 (Status={})", st));
-                *issues += 1;
-            }
-        }
-        return;
-    }
-
-    // ---- 修复 ----
-    let mut need_reinstall = reinstall || state == SvcState::Missing;
-
-    if !need_reinstall && state != SvcState::Running {
-        log(Level::Info, "服务存在但未运行, 先尝试直接启动...");
-        start_service(&svc_name);
-        thread::sleep(Duration::from_secs(5));
-        state = service_state(&svc_name);
-        if state == SvcState::Running && probe::port_listening(port) {
-            log(Level::Ok, &format!("启动成功, 端口 {} 已监听。", port));
+        let l2 = if l1 {
+            Some(probe::http_probe_against(rc.port, &rc.pathname, &rc.def.l2_ok))
         } else {
-            log(Level::Warn, "直接启动失败或端口未监听, 转入重装流程。");
-            need_reinstall = true;
-        }
-    }
-
-    if need_reinstall {
-        if state != SvcState::Missing {
-            log(Level::Info, &format!("卸载旧服务 {} ...", svc_name));
-            run_node_logged(node_exe, &uninstall_js, None, "uninstall");
-            stop_service(&svc_name);
-            delete_service(&svc_name);
-            thread::sleep(Duration::from_secs(3));
-        }
-        log(Level::Info, "重装服务 (重建 daemon 守护进程)...");
-        run_node_logged(node_exe, &install_js, Some(&comp_dir), "install");
-
-        // service.install.js 安装后通常会自动 start, 这里再兜底启动一次
-        thread::sleep(Duration::from_secs(5));
-        let st = service_state(&svc_name);
-        if st != SvcState::Missing && st != SvcState::Running {
-            start_service(&svc_name);
-        }
-    }
-
-    // 等待端口监听 (最多 60 秒)
-    let mut ok = false;
-    for _ in 0..12 {
-        if probe::port_listening(port) {
-            ok = true;
-            break;
-        }
-        thread::sleep(Duration::from_secs(5));
-    }
-    let http = ok
-        && matches!(
-            probe::http_probe_against(port, &format!("/{}", name), &model::StatusSet::WEB),
-            model::L2::Ok(_)
+            None
+        };
+        let v = model::attribute(
+            if l1 { model::L1::Listening } else { model::L1::NotListening },
+            l2,
+            None,
         );
-
-    if ok && http {
         log(
-            Level::Ok,
-            &format!(
-                "[{}] 修复成功: 服务运行中, 端口 {} 监听, HTTP 响应正常。",
-                name, port
-            ),
+            if v.exit_contrib == 0 { Level::Ok } else { Level::Err },
+            &v.cause,
         );
-    } else if ok {
+        *issues += v.exit_contrib as u32;
+        return v.exit_contrib;
+    }
+
+    // spec §6 步骤 3: 服务在跑但端口未起, 先等到 start_timeout, 别急着 restart
+    if state == SvcState::Running && !l1 {
         log(
-            Level::Warn,
-            &format!(
-                "[{}] 端口 {} 已监听, 但 HTTP 检查未通过 (可能仍在初始化, 稍后刷新页面确认)。",
-                name, port
-            ),
+            Level::Info,
+            &format!("服务运行中但端口未监听, 等待至 {}s ...", rc.def.start_timeout_secs),
         );
+        l1 = wait_for_port(rc);
+    }
+
+    let steps = plan_repair(rc.def.kind, state, l1, reinstall);
+    if steps.is_empty() {
+        log(Level::Ok, "无需修复。");
+        return 0;
+    }
+    if rc.def.kind == model::Kind::Prunsrv
+        && steps.contains(&RepairStep::PrunsrvReinstall)
+        && !assume_yes
+        && !confirm(&format!(
+            "即将卸载并重装 Java 网关服务 {} (影响整个 OpenAPI 平台), 确认? [y/N]",
+            rc.svc_name
+        ))
+    {
+        log(Level::Warn, "用户取消网关重装。");
         *issues += 1;
-    } else {
+        return 1;
+    }
+
+    for st in steps {
+        match st {
+            RepairStep::ScStart => {
+                log(Level::Info, &format!("sc start {}", rc.svc_name));
+                start_service(&rc.svc_name);
+            }
+            RepairStep::ScStop => stop_service(&rc.svc_name),
+            RepairStep::ScDelete => delete_service(&rc.svc_name),
+            RepairStep::NodeUninstall => {
+                run_node_logged(node_exe, &rc.dir.join("service.uninstall.js"), None, "uninstall")
+            }
+            RepairStep::NodeInstall => run_node_logged(
+                node_exe,
+                &rc.dir.join("service.install.js"),
+                Some(&rc.dir),
+                "install",
+            ),
+            RepairStep::PrunsrvInstall => run_prunsrv_bat(&rc.dir, "install", "prunsrv"),
+            RepairStep::PrunsrvRestart => run_prunsrv_bat(&rc.dir, "restart", "prunsrv"),
+            RepairStep::PrunsrvReinstall => {
+                run_prunsrv_bat(&rc.dir, "uninstall", "prunsrv");
+                thread::sleep(Duration::from_secs(3));
+                run_prunsrv_bat(&rc.dir, "install", "prunsrv");
+            }
+        }
+    }
+
+    if !probe::port_listening(rc.port) && !wait_for_port(rc) {
         log(
             Level::Err,
-            &format!(
-                "[{}] 修复失败: 端口 {} 未监听。请查看 daemon\\wrapper.log 与 log.txt。",
-                name, port
-            ),
+            &format!("[{}] 修复失败: 端口 {} 未监听。", rc.def.key, rc.port),
         );
-        print_wrapper_tail(&comp_dir, &svc_name);
+        dump_component_logs(rc);
         *issues += 1;
+        return 1;
     }
+    let l2 = probe::http_probe_against(rc.port, &rc.pathname, &rc.def.l2_ok);
+    let verdict = model::attribute(model::L1::Listening, Some(l2), None);
+    log(
+        if verdict.exit_contrib == 0 { Level::Ok } else { Level::Warn },
+        &format!("[{}] 端口 {} 已监听; {}", rc.def.key, rc.port, verdict.cause),
+    );
+    *issues += verdict.exit_contrib as u32;
+    verdict.exit_contrib
 }
 
 // ------------------------------- 主流程 ------------------------------------
@@ -624,15 +685,11 @@ fn run_flow(action: Action, root_arg: Option<String>) -> i32 {
     }
 
     // == 4. 组件修复 ==
-    repair_component("artemis-web", &root, &node, reinstall, check_only, &mut issues);
-    repair_component(
-        "artemis-portal",
-        &root,
-        &node,
-        reinstall,
-        check_only,
-        &mut issues,
-    );
+    // Task 9 会按 --components 选项重组这一段, 这里先接上新的 resolve/repair 契约
+    for def in model::COMPONENTS {
+        let rc = model::resolve_component(def, &root);
+        repair_component(&rc, &node, reinstall, check_only, false, &mut issues);
+    }
 
     // == 5. 汇总 ==
     log(Level::Step, "==== 汇总 ====");
@@ -828,5 +885,49 @@ mod tests {
         assert_eq!(find_node_exe(&bare), None);
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&bare);
+    }
+
+    #[test]
+    fn 网关默认只到restart重装需显式授权() {
+        // spec §6 Prunsrv 阶梯 + D2
+        let s = plan_repair(model::Kind::Prunsrv, SvcState::Running, false, false);
+        assert_eq!(s, vec![RepairStep::PrunsrvRestart]);
+        let s = plan_repair(model::Kind::Prunsrv, SvcState::Running, false, true);
+        assert_eq!(
+            s,
+            vec![RepairStep::PrunsrvRestart, RepairStep::PrunsrvReinstall]
+        );
+        // 服务在跑但端口已起 -> 什么都不做
+        assert_eq!(
+            plan_repair(model::Kind::Prunsrv, SvcState::Running, true, true),
+            Vec::new()
+        );
+        // Missing -> install 后再 sc start (spec §6 步骤 1)
+        assert_eq!(
+            plan_repair(model::Kind::Prunsrv, SvcState::Missing, false, false),
+            vec![RepairStep::PrunsrvInstall, RepairStep::ScStart]
+        );
+        // Stopped -> 仅 sc start
+        assert_eq!(
+            plan_repair(model::Kind::Prunsrv, SvcState::Stopped, false, false),
+            vec![RepairStep::ScStart]
+        );
+    }
+
+    #[test]
+    fn node阶梯保持既有行为() {
+        use model::Kind::Node;
+        use RepairStep::*;
+        assert_eq!(
+            plan_repair(Node, SvcState::Missing, false, false),
+            vec![NodeUninstall, ScStop, ScDelete, NodeInstall, ScStart]
+        );
+        assert_eq!(plan_repair(Node, SvcState::Stopped, false, false), vec![ScStart]);
+        assert_eq!(plan_repair(Node, SvcState::Running, true, false), Vec::new());
+        // Running 但端口未起 -> 走重装 (spec §1 行1 的成因)
+        assert_eq!(
+            plan_repair(Node, SvcState::Running, false, false),
+            vec![NodeUninstall, ScStop, ScDelete, NodeInstall, ScStart]
+        );
     }
 }
