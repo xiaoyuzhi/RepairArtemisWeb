@@ -39,6 +39,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <string>
 #include <thread>
@@ -626,6 +627,60 @@ static std::wstring ascii_value_to_wide(const std::string& v) {
     w.reserve(v.size());
     for (unsigned char c : v) w.push_back((wchar_t)c);
     return w;
+}
+
+// ----------------------------------------------------------------------------
+// 通用 properties / HTTP 状态行解析 (与 Rust model::parse_properties,
+// logs::parse_status_line 逐条对齐)
+// ----------------------------------------------------------------------------
+
+// 跳过 `#` / `!` 注释行; 键取第一个 '=' 前并去尾空白; 值保留其余原样 (含后续 '=')
+static std::map<std::string, std::string> parse_properties(const std::string& text) {
+    std::map<std::string, std::string> m;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t nl = text.find('\n', pos);
+        std::string raw = (nl == std::string::npos) ? text.substr(pos)
+                                                    : text.substr(pos, nl - pos);
+        if (!raw.empty() && raw.back() == '\r') raw.pop_back();
+        size_t b = raw.find_first_not_of(" \t");
+        if (b != std::string::npos) {
+            std::string line = raw.substr(b);
+            if (line[0] != '#' && line[0] != '!') {
+                size_t eq = line.find('=');
+                if (eq != std::string::npos) {
+                    std::string key = trim_ws(line.substr(0, eq));
+                    size_t vb = line.find_first_not_of(" \t", eq + 1);
+                    std::string value =
+                        (vb == std::string::npos) ? std::string() : line.substr(vb);
+                    if (!key.empty()) m[key] = value;
+                }
+            }
+        }
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+    return m;
+}
+
+// 仅接受 "HTTP/1.x <3位数字>" 形态; 成功时写入 out 并返回 true
+static bool parse_status_line(const std::string& line, unsigned short& out) {
+    size_t b = line.find_first_not_of(" \t");
+    if (b == std::string::npos) return false;
+    std::string t = line.substr(b);
+    if (t.compare(0, 5, "HTTP/") != 0) return false;
+    size_t sp = t.find_first_of(" \t", 5);
+    if (sp == std::string::npos) return false;
+    size_t b2 = t.find_first_not_of(" \t", sp + 1);
+    if (b2 == std::string::npos) return false;
+    size_t e2 = t.find_first_of(" \t", b2);
+    std::string code =
+        (e2 == std::string::npos) ? t.substr(b2) : t.substr(b2, e2 - b2);
+    if (code.size() != 3) return false;
+    for (char c : code)
+        if (c < '0' || c > '9') return false;
+    out = (unsigned short)std::stoi(code);
+    return true;
 }
 
 static CompConfig read_config(const fs::path& dir) {

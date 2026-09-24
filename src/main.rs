@@ -20,6 +20,11 @@
 //   版权:   Copyright (c) 2026 余志强 (Yu Zhiqiang). All rights reserved.
 // ============================================================================
 
+mod logs;
+mod model;
+mod nginx;
+mod probe;
+
 use std::env;
 use std::ffi::c_void;
 use std::fs;
