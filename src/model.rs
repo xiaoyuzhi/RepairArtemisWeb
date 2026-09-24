@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 /// 解析 Java/.NET 风格 properties。
 /// 跳过以 `#` 或 `!` 开头的注释行；键与第一个 `=` 两侧空白剥离；
-/// 值保留其余部分原样（含后续 `=`、`:`、空格）。
+/// 值保留其余部分原样（含后续 `=`、`:`、内部空格），仅去掉尾随空白 ——
+/// 手工编辑的配置行尾多一个空格极常见，留着它会让端口解析失败并回退到兜底值。
 pub fn parse_properties(text: &str) -> HashMap<String, String> {
     let mut m = HashMap::new();
     for raw in text.lines() {
@@ -18,7 +19,7 @@ pub fn parse_properties(text: &str) -> HashMap<String, String> {
         }
         let Some(eq) = line.find('=') else { continue };
         let key = line[..eq].trim_end().to_string();
-        let value = line[eq + 1..].trim_start().to_string();
+        let value = line[eq + 1..].trim_start().trim_end().to_string();
         if key.is_empty() {
             continue;
         }
@@ -151,6 +152,13 @@ fn props_for(def: &ComponentDef, dir: &Path) -> HashMap<String, String> {
     }
 }
 
+/// 空串等同于"没配"：让调用方走兜底并告警。
+/// 把 `service.name =` 读成空服务名会让 `sc query ""` 恒返回"服务不存在",
+/// 进而触发整条卸载重装阶梯 —— 在最不该动的分支上白拆一次服务。
+fn meaningful(p: &HashMap<String, String>, key: &str) -> Option<String> {
+    p.get(key).cloned().filter(|v| !v.is_empty())
+}
+
 /// 读配置得到 svc/port/pathname; 任一失败则用兜底值并记 Warn (spec §5)。
 pub fn resolve_component(def: &'static ComponentDef, root: &Path) -> ResolvedComponent {
     let dir = root.join(def.rel_dir);
@@ -165,15 +173,15 @@ pub fn resolve_component(def: &'static ComponentDef, root: &Path) -> ResolvedCom
                 warnings.push(format!("未读到 _ServerName, 用兜底服务名 {}", def.default_svc));
                 def.default_svc.to_string()
             }),
-        Kind::Node => p.get("service.name").cloned().unwrap_or_else(|| {
+        Kind::Node => meaningful(&p, "service.name").unwrap_or_else(|| {
             warnings.push(format!("未读到 service.name, 用兜底服务名 {}", def.default_svc));
             def.default_svc.to_string()
         }),
     };
 
-    let port = p
-        .get("server.port")
+    let port = meaningful(&p, "server.port")
         .and_then(|v| v.parse::<u16>().ok())
+        .filter(|v| *v > 0)
         .unwrap_or_else(|| {
             warnings.push(format!("未读到 server.port, 用兜底端口 {}", def.default_port));
             def.default_port
@@ -183,15 +191,17 @@ pub fn resolve_component(def: &'static ComponentDef, root: &Path) -> ResolvedCom
         Kind::Prunsrv => "server.context-path",
         Kind::Node => "server.pathname",
     };
-    let pathname = p
-        .get(key)
-        .cloned()
+    let pathname = meaningful(&p, key)
         .unwrap_or_else(|| {
             warnings.push(format!("未读到 {}, 用兜底路径 {}", key, def.default_pathname));
             def.default_pathname.to_string()
-        })
-        .trim_end_matches('/')
-        .to_string();
+        });
+    // 只去掉多余的尾斜杠, 但 "/" 本身要保留 (与 C++ 版一致, 否则报告表里路由列一版空一版 "/")
+    let pathname = if pathname.len() > 1 && pathname.ends_with('/') {
+        pathname.trim_end_matches('/').to_string()
+    } else {
+        pathname
+    };
 
     let present = dir.join(def.present_marker).is_file();
     ResolvedComponent { def, dir, svc_name, port, pathname, present, warnings }
@@ -253,6 +263,17 @@ impl VerdictAction {
             VerdictAction::NginxAttrib => "改 nginx 配置, 不要重启后端",
             VerdictAction::Unverifiable => "确认 System32\\curl.exe 存在, 或用 --e2e-host 指定地址",
         }
+    }
+}
+
+/// L3 没有真正验过时给出可告知用户的原因。spec D1b: 降级但不伪造, 也不静默。
+/// 返回 None 表示这一层的结论是可信的 (Ok / Bad / 未探)。
+pub fn unverified_l3_note(l3: Option<L3>) -> Option<&'static str> {
+    match l3 {
+        Some(L3::Skipped) => Some("端到端未执行: 未找到系统 curl.exe 或 --e2e-host 非法"),
+        Some(L3::TlsUnavailable) => Some("端到端未验证: curl 未能取到状态码 (握手或网络失败)"),
+        Some(L3::Raw(_)) => Some("端到端结果未经归类"),
+        _ => None,
     }
 }
 
@@ -331,6 +352,10 @@ mod tests {
             Some("/artemis")
         );
         assert_eq!(p.get("server.port").map(|s| s.as_str()), Some("9016"));
+        // 值里真正含第二个 = 时不得在第二个 = 处截断
+        let q = parse_properties("pwdsalt = a=b=c\nx=y=z w\n");
+        assert_eq!(q.get("pwdsalt").map(|s| s.as_str()), Some("a=b=c"));
+        assert_eq!(q.get("x").map(|s| s.as_str()), Some("y=z w"));
     }
 
     #[test]
@@ -487,6 +512,60 @@ set _DisplayName=artemis
             let v = attribute(L1::Listening, Some(L2::Ok(200)), Some(l3));
             assert_ne!(v.action, VerdictAction::RepairBackend, "L3={:?} 触发了后端修复", l3);
         }
+    }
+
+    #[test]
+    fn 值尾随空白不得毁掉端口与路径解析() {
+        // 配置行结尾多一个空格是手工编辑平台配置最常见的事故;
+        // 留着它会让 parse::<u16>() 失败 -> 兜底端口 -> 探错端口 -> 白拆服务
+        let p = parse_properties("server.port = 9017 \r\nserver.pathname = /artemis-web  \n");
+        assert_eq!(p.get("server.port").map(|s| s.as_str()), Some("9017"));
+        assert_eq!(p.get("server.pathname").map(|s| s.as_str()), Some("/artemis-web"));
+    }
+
+    #[test]
+    fn 空值与端口零等同于未配置并回退兜底() {
+        let dir = std::env::temp_dir().join(format!("raw_i3_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let d = dir.join(COMPONENTS[1].rel_dir);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join(COMPONENTS[1].present_marker), b"x").unwrap();
+        fs::write(
+            d.join("config.properties"),
+            "service.name =\nserver.port = 0\nserver.pathname =\n",
+        )
+        .unwrap();
+        let rc = resolve_component(&COMPONENTS[1], &dir);
+        // 空值/0 端口都不能当成读到了值, 否则 sc query "" 恒 Missing -> 整条卸载重装阶梯
+        assert_eq!(rc.svc_name, COMPONENTS[1].default_svc);
+        assert_eq!(rc.port, COMPONENTS[1].default_port);
+        assert_eq!(rc.pathname, COMPONENTS[1].default_pathname);
+        assert_eq!(rc.warnings.len(), 3, "{:?}", rc.warnings);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 无HTTP占用归因文案与CPP版逐字一致() {
+        // README 承诺双版本输出逐行一致; 这一行是故障机上才会出现的行,
+        // 健康机冒烟永远碰不到, 故用字面量钉住, C++ 侧漂移会在这里暴露。
+        use crate::model::{attribute, L1, L2};
+        let v = attribute(L1::Listening, Some(L2::NoHttpResponse), None);
+        assert_eq!(v.cause, "端口已监听但无 HTTP 响应 (疑被非 HTTP 进程占用)");
+    }
+
+    #[test]
+    fn 端到端未验证时必须给得出为什么未验证() {
+        // spec D1b: 降级但不伪造, 且要告知用户
+        use crate::model::L3;
+        assert!(unverified_l3_note(Some(L3::Ok(200))).is_none());
+        assert!(unverified_l3_note(Some(L3::Bad(502))).is_none());
+        assert!(unverified_l3_note(None).is_none());
+        let s = unverified_l3_note(Some(L3::Skipped)).expect("Skipped 必须给原因");
+        assert!(s.contains("curl"), "{}", s);
+        let t = unverified_l3_note(Some(L3::TlsUnavailable)).expect("TLS 失败必须给原因");
+        assert!(t.contains("端到端"), "{}", t);
+        let r = unverified_l3_note(Some(L3::Raw(200))).expect("未归类必须给原因");
+        assert!(r.contains("未经归类"), "{}", r);
     }
 
     #[test]

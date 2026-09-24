@@ -304,15 +304,14 @@ fn plan_repair(kind: model::Kind, state: SvcState, l1_up: bool, reinstall: bool)
             }
         }
         Prunsrv => {
-            // spec §6 步骤 4: --reinstall 只是"端口起不来时允许升级到重装",
-            // 不能拿它去重装一个已经健康的网关 (D2 的保守一级正在这里)
+            // spec §6 步骤 4: 装不重装由 plan_repair_retry 在"端口仍未起"之后决定,
+            // 这里塞进同一阶梯会让它紧跟 restart 执行 (D2 的保守一级就丢了)
             if state == SvcState::Running && l1_up {
                 return Vec::new();
             }
             match state {
                 SvcState::Missing => vec![PrunsrvInstall, ScStart],
                 SvcState::Stopped => vec![ScStart],
-                _ if reinstall => vec![PrunsrvRestart, PrunsrvReinstall],
                 _ => vec![PrunsrvRestart],
             }
         }
@@ -492,6 +491,36 @@ fn confirm(prompt: &str) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// 执行一组阶梯动作。第一/第二阶梯共用。
+fn run_steps(steps: &[RepairStep], rc: &model::ResolvedComponent, node_exe: &Path) {
+    for st in steps {
+        match st {
+            RepairStep::ScStart => {
+                log(Level::Info, &format!("sc start {}", rc.svc_name));
+                start_service(&rc.svc_name);
+            }
+            RepairStep::ScStop => stop_service(&rc.svc_name),
+            RepairStep::ScDelete => delete_service(&rc.svc_name),
+            RepairStep::NodeUninstall => {
+                run_node_logged(node_exe, &rc.dir.join("service.uninstall.js"), None, "uninstall")
+            }
+            RepairStep::NodeInstall => run_node_logged(
+                node_exe,
+                &rc.dir.join("service.install.js"),
+                Some(&rc.dir),
+                "install",
+            ),
+            RepairStep::PrunsrvInstall => run_prunsrv_bat(&rc.dir, "install", "prunsrv"),
+            RepairStep::PrunsrvRestart => run_prunsrv_bat(&rc.dir, "restart", "prunsrv"),
+            RepairStep::PrunsrvReinstall => {
+                run_prunsrv_bat(&rc.dir, "uninstall", "prunsrv");
+                thread::sleep(Duration::from_secs(3));
+                run_prunsrv_bat(&rc.dir, "install", "prunsrv");
+            }
+        }
+    }
+}
+
 /// 返回该组件对异常计数的贡献: 0 正常, 1 异常, 3 nginx 层。
 fn repair_component(
     rc: &model::ResolvedComponent,
@@ -556,54 +585,43 @@ fn repair_component(
         log(Level::Ok, "无需修复。");
         return 0;
     }
-    if rc.def.kind == model::Kind::Prunsrv
-        && steps.contains(&RepairStep::PrunsrvReinstall)
-        && !assume_yes
-        && !confirm(&format!(
-            "即将卸载并重装 Java 网关服务 {} (影响整个 OpenAPI 平台), 确认? [y/N]",
-            rc.svc_name
-        ))
-    {
-        log(Level::Warn, "用户取消网关重装。");
-        *issues += 1;
-        return 1;
-    }
-
-    for st in steps {
-        match st {
-            RepairStep::ScStart => {
-                log(Level::Info, &format!("sc start {}", rc.svc_name));
-                start_service(&rc.svc_name);
-            }
-            RepairStep::ScStop => stop_service(&rc.svc_name),
-            RepairStep::ScDelete => delete_service(&rc.svc_name),
-            RepairStep::NodeUninstall => {
-                run_node_logged(node_exe, &rc.dir.join("service.uninstall.js"), None, "uninstall")
-            }
-            RepairStep::NodeInstall => run_node_logged(
-                node_exe,
-                &rc.dir.join("service.install.js"),
-                Some(&rc.dir),
-                "install",
-            ),
-            RepairStep::PrunsrvInstall => run_prunsrv_bat(&rc.dir, "install", "prunsrv"),
-            RepairStep::PrunsrvRestart => run_prunsrv_bat(&rc.dir, "restart", "prunsrv"),
-            RepairStep::PrunsrvReinstall => {
-                run_prunsrv_bat(&rc.dir, "uninstall", "prunsrv");
-                thread::sleep(Duration::from_secs(3));
-                run_prunsrv_bat(&rc.dir, "install", "prunsrv");
-            }
-        }
-    }
+    run_steps(&steps, rc, node_exe);
 
     if !probe::port_listening(rc.port) && !wait_for_port(rc) {
+        // 第一阶梯没把端口弄起来 -> 才允许考虑升级 (spec §6 步骤 4)
+        let retry = plan_repair_retry(rc.def.kind, reinstall);
+        let refused = retry.contains(&RepairStep::PrunsrvReinstall)
+            && !assume_yes
+            && !confirm(&format!(
+                "restart 后端口 {} 仍未监听。即将卸载并重装 Java 网关服务 {} (影响整个 OpenAPI 平台), 确认? [y/N]",
+                rc.port, rc.svc_name
+            ));
+        if retry.is_empty() || refused {
+            if refused {
+                log(Level::Warn, "用户取消网关重装。");
+            }
+            log(
+                Level::Err,
+                &format!("[{}] 修复失败: 端口 {} 未监听。", rc.def.key, rc.port),
+            );
+            dump_component_logs(rc);
+            *issues += 1;
+            return 1;
+        }
         log(
-            Level::Err,
-            &format!("[{}] 修复失败: 端口 {} 未监听。", rc.def.key, rc.port),
+            Level::Warn,
+            &format!("[{}] 端口仍未监听, 升级到第二阶梯", rc.def.key),
         );
-        dump_component_logs(rc);
-        *issues += 1;
-        return 1;
+        run_steps(&retry, rc, node_exe);
+        if !probe::port_listening(rc.port) && !wait_for_port(rc) {
+            log(
+                Level::Err,
+                &format!("[{}] 修复失败: 端口 {} 未监听。", rc.def.key, rc.port),
+            );
+            dump_component_logs(rc);
+            *issues += 1;
+            return 1;
+        }
     }
     let l2 = probe::http_probe_against(rc.port, &rc.pathname, &rc.def.l2_ok);
     let verdict = model::attribute(model::L1::Listening, Some(l2), None);
@@ -654,8 +672,80 @@ impl Default for Options {
     }
 }
 
-/// 报告表的一行: (路由, 目标端口, L1, L2, L3)。L2/L3 为 None 表示未探或跳过。
-pub type RouteRow = (String, String, model::L1, Option<model::L2>, Option<model::L3>);
+/// 报告表的一行。l2/l3 为 None 表示未探或跳过。
+#[derive(Clone)]
+pub struct RouteRow {
+    pub path: String,
+    pub target: String,
+    pub l1: model::L1,
+    pub l2: Option<model::L2>,
+    pub l3: Option<model::L3>,
+}
+
+/// 纯函数: 第一阶梯失败后允许升级到什么。保持 plan_* 都是无副作用的。
+/// Node 沿用既有流程 (启动不成就卸载重装); 网关只在显式 --reinstall 时才重装。
+fn plan_repair_retry(kind: model::Kind, reinstall: bool) -> Vec<RepairStep> {
+    use model::Kind::*;
+    use RepairStep::*;
+    match kind {
+        Node => vec![NodeUninstall, ScStop, ScDelete, NodeInstall, ScStart],
+        Prunsrv if reinstall => vec![PrunsrvReinstall],
+        Prunsrv => Vec::new(),
+    }
+}
+
+/// 各路由的 exit_contrib 汇总。3 的含义是"后端健康, 别动后端"(D3),
+/// 所以只要有一条路由需要修后端(1), 整体就不能报 3。
+fn overall_exit(contribs: &[u8], issues: u32) -> i32 {
+    if contribs.iter().any(|c| *c == 1) {
+        1
+    } else if contribs.iter().any(|c| *c == 3) {
+        3
+    } else if issues > 0 {
+        1
+    } else {
+        0 }
+}
+
+/// spec §13.3: 端到端必须真的验过并通过, 才允许宣布"修复成功"。
+fn layers_all_verified(rows: &[RouteRow]) -> bool {
+    !rows.is_empty()
+        && rows.iter().all(|r| {
+            model::attribute(r.l1, r.l2, r.l3).exit_contrib == 0
+                && matches!(r.l3, Some(model::L3::Ok(_)))
+        })
+}
+
+/// spec §9 报告表。每行: 路由 / 目标端口 / L1 / L2 / L3 / 结论。
+pub fn render_route_table(rows: &[RouteRow]) -> String {
+    use model::{L2, L3};
+    let mut s = String::new();
+    s.push_str("路由              目标    L1      L2直连      L3经nginx   结论\n");
+    for r in rows {
+        let v = model::attribute(r.l1, r.l2, r.l3);
+        let l1s = if r.l1 == model::L1::Listening { "监听" } else { "未监听" };
+        let l2s = match r.l2 {
+            Some(L2::Ok(c)) => format!("{}", c),
+            Some(L2::ServerError(c)) => format!("{}!", c),
+            Some(L2::Unexpected(c)) => format!("{}!", c),
+            Some(L2::NoHttpResponse) => "无HTTP响应".into(),
+            None => "-".into(),
+        };
+        let l3s = match r.l3 {
+            Some(L3::Ok(c)) => format!("{}", c),
+            Some(L3::Bad(c)) => format!("{}!", c),
+            Some(L3::Raw(c)) => format!("{}?", c),
+            Some(L3::TlsUnavailable) => "TLS不可用".into(),
+            Some(L3::NginxDown) => "443不可达".into(),
+            Some(L3::Skipped) | None => "-".into(),
+        };
+        s.push_str(&format!(
+            "{:<16}  {:<7}  {:<7}  {:<11}  {:<11}  {}\n",
+            r.path, r.target, l1s, l2s, l3s, v.cause
+        ));
+    }
+    s
+}
 
 pub fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut o = Options::default();
@@ -707,40 +797,10 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
 /// parse_args 用它表示"该打印帮助", 避免拿错误码字符串做判断。
 const HELP: &str = "\u{0}HELP";
 
-/// spec §9 报告表。每行: 路由 / 目标端口 / L1 / L2 / L3 / 结论。
-pub fn render_route_table(rows: &[RouteRow]) -> String {
-    use model::{L1, L2, L3};
-    let mut s = String::new();
-    s.push_str("路由              目标    L1      L2直连      L3经nginx   结论\n");
-    for (path, target, l1, l2, l3) in rows {
-        let v = model::attribute(*l1, *l2, *l3);
-        let l1s = if *l1 == L1::Listening { "监听" } else { "未监听" };
-        let l2s = match l2 {
-            Some(L2::Ok(c)) => format!("{}", c),
-            Some(L2::ServerError(c)) => format!("{}!", c),
-            Some(L2::Unexpected(c)) => format!("{}!", c),
-            Some(L2::NoHttpResponse) => "无HTTP响应".into(),
-            None => "-".into(),
-        };
-        let l3s = match l3 {
-            Some(L3::Ok(c)) => format!("{}", c),
-            Some(L3::Bad(c)) => format!("{}!", c),
-            Some(L3::Raw(c)) => format!("{}?", c),
-            Some(L3::TlsUnavailable) => "TLS不可用".into(),
-            Some(L3::NginxDown) => "443不可达".into(),
-            Some(L3::Skipped) | None => "-".into(),
-        };
-        s.push_str(&format!(
-            "{:<16}  {:<7}  {:<7}  {:<11}  {:<11}  {}\n",
-            path, target, l1s, l2s, l3s, v.cause
-        ));
-    }
-    s
-}
-
 fn run_flow(opts: &Options) -> i32 {
     let mut issues: u32 = 0;
-    let mut exit_max: u8 = 0;
+    // 每条路由/每个组件对退出码的贡献, 最后由 overall_exit 汇总
+    let mut contribs: Vec<u8> = Vec::new();
 
     // == 1. 定位安装目录 ==
     let mut root = PathBuf::from(opts.root.clone().unwrap_or_else(|| {
@@ -836,12 +896,12 @@ fn run_flow(opts: &Options) -> i32 {
                     Level::Err,
                     "$artemis 非 \"local\": /artemis* 会回环到 nginx 自身 (https_artemis_remote=127.0.0.1:443), 后端服务无需重启",
                 );
-                exit_max = exit_max.max(3);
+                contribs.push(3);
                 issues += 1;
             }
         }
         None => {
-            log(Level::Warn, "未定位到 nginx, L3 端到端与 nginx 归因跳过。");
+            log(Level::Warn, "未定位到 nginx, 跳过 nginx 静态归因 (L3 端到端仍会实测)。");
         }
     }
 
@@ -853,9 +913,14 @@ fn run_flow(opts: &Options) -> i32 {
             None => continue, // parse_args 已挡掉未知组件
         };
         let rc = model::resolve_component(def, &root);
-        let contrib =
-            repair_component(&rc, &node, opts.reinstall, opts.check_only, opts.assume_yes, &mut issues);
-        exit_max = exit_max.max(contrib);
+        contribs.push(repair_component(
+            &rc,
+            &node,
+            opts.reinstall,
+            opts.check_only,
+            opts.assume_yes,
+            &mut issues,
+        ));
         selected.push(rc);
     }
 
@@ -878,13 +943,13 @@ fn run_flow(opts: &Options) -> i32 {
             let raw = probe::https_probe(&opts.e2e_host, 443, &format!("{}/", rc.pathname));
             Some(probe::classify_l3(raw, &rc.def.l2_ok, nginx_up))
         };
-        rows.push((
-            rc.pathname.clone(),
-            format!("{}", rc.port),
-            if l1 { model::L1::Listening } else { model::L1::NotListening },
+        rows.push(RouteRow {
+            path: rc.pathname.clone(),
+            target: format!("{}", rc.port),
+            l1: if l1 { model::L1::Listening } else { model::L1::NotListening },
             l2,
             l3,
-        ));
+        });
     }
     if !rows.is_empty() {
         log(Level::Step, "==== 路由归因表 ====");
@@ -892,16 +957,24 @@ fn run_flow(opts: &Options) -> i32 {
             log(Level::Info, line);
         }
     }
-    for (path, target, l1, l2, l3) in &rows {
-        let v = model::attribute(*l1, *l2, *l3);
-        exit_max = exit_max.max(v.exit_contrib);
-        if v.exit_contrib == 0 {
+    for r in &rows {
+        let v = model::attribute(r.l1, r.l2, r.l3);
+        contribs.push(v.exit_contrib);
+        // 端到端这一层没真验过: 静默降级会让人以为三层都查过了 (spec D1b)。
+        // --no-e2e 是用户主动跳过的, 不该被说成"找不到 curl"。
+        if opts.e2e {
+            if let Some(why) = model::unverified_l3_note(r.l3) {
+                log(Level::Warn, &format!("{}: {}", r.path, why));
+            }
+        }
+        if v.exit_contrib == 0 && matches!(v.action, model::VerdictAction::None) {
             continue;
         }
         let hint = v.action.next_step();
         // 端口在听但没 HTTP 响应: 把占用者 PID 一起报出来, 否则用户只能自己 netstat
-        let occupier = match l2 {
-            Some(model::L2::NoHttpResponse) => target
+        let occupier = match r.l2 {
+            Some(model::L2::NoHttpResponse) => r
+                .target
                 .parse::<u16>()
                 .ok()
                 .and_then(probe::port_owner_pid)
@@ -909,9 +982,9 @@ fn run_flow(opts: &Options) -> i32 {
             _ => None,
         };
         let msg = match (&occupier, hint) {
-            (Some(p), h) if !h.is_empty() => format!("{}: {} | {}", path, p, h),
-            (Some(p), _) => format!("{}: {}", path, p),
-            (None, h) if !h.is_empty() => format!("{}: {}", path, h),
+            (Some(p), h) if !h.is_empty() => format!("{}: {} | {}", r.path, p, h),
+            (Some(p), _) => format!("{}: {}", r.path, p),
+            (None, h) if !h.is_empty() => format!("{}: {}", r.path, h),
             _ => continue,
         };
         log(Level::Warn, &msg);
@@ -919,12 +992,8 @@ fn run_flow(opts: &Options) -> i32 {
 
     // == 7. 汇总 ==
     log(Level::Step, "==== 汇总 ====");
-    // spec §13.3: 只有 L1+L2+L3 全部通过才说"修复成功"
-    let all_pass = !rows.is_empty()
-        && rows
-            .iter()
-            .all(|(_, _, l1, l2, l3)| model::attribute(*l1, *l2, *l3).exit_contrib == 0);
-    if !opts.check_only && all_pass {
+    // spec §13.3: 端到端必须真的验过并通过, 才允许宣布"修复成功"
+    if !opts.check_only && layers_all_verified(&rows) {
         log(Level::Ok, "修复成功: 全部路由的 L1/L2/L3 三层均通过。");
     }
     if opts.check_only {
@@ -932,11 +1001,7 @@ fn run_flow(opts: &Options) -> i32 {
     } else {
         log(Level::Info, &format!("修复流程完成。异常项: {}", issues));
     }
-    if issues > 0 && exit_max < 3 {
-        1
-    } else {
-        exit_max as i32
-    }
+    overall_exit(&contribs, issues)
 }
 
 fn choose_action_interactive(admin: bool) -> Option<Action> {
@@ -1085,11 +1150,6 @@ mod tests {
         // spec §6 Prunsrv 阶梯 + D2
         let s = plan_repair(model::Kind::Prunsrv, SvcState::Running, false, false);
         assert_eq!(s, vec![RepairStep::PrunsrvRestart]);
-        let s = plan_repair(model::Kind::Prunsrv, SvcState::Running, false, true);
-        assert_eq!(
-            s,
-            vec![RepairStep::PrunsrvRestart, RepairStep::PrunsrvReinstall]
-        );
         // 服务在跑但端口已起 -> 什么都不做
         assert_eq!(
             plan_repair(model::Kind::Prunsrv, SvcState::Running, true, true),
@@ -1122,6 +1182,73 @@ mod tests {
             plan_repair(Node, SvcState::Running, false, false),
             vec![NodeUninstall, ScStop, ScDelete, NodeInstall, ScStart]
         );
+    }
+
+    #[test]
+    fn 网关重装只在restart后端口仍不起时才升级() {
+        // spec §6 步骤 3-4 + D2: restart -> 等到 start_timeout -> 仍 ✗ 才允许 uninstall+install。
+        // 把重装预先放进同一阶梯会让它紧跟在 restart 后面执行, 也就是在 Spring Boot
+        // 自己的 90 秒启动窗口里把服务拆掉重建。
+        assert_eq!(
+            plan_repair(model::Kind::Prunsrv, SvcState::Running, false, true),
+            vec![RepairStep::PrunsrvRestart]
+        );
+        assert_eq!(
+            plan_repair_retry(model::Kind::Prunsrv, true),
+            vec![RepairStep::PrunsrvReinstall]
+        );
+        // 没给 --reinstall 就永远不升级到重装
+        assert_eq!(plan_repair_retry(model::Kind::Prunsrv, false), Vec::new());
+    }
+
+    #[test]
+    fn node启动失败后升级到重装阶梯() {
+        // spec §6: Node "保留现有流程" —— sc start 起来但端口不通要转入卸载重装,
+        // 而 sc start 失败正是 koa 服务注册信息损坏的典型形态, 即本工具立项要修的场景。
+        assert_eq!(
+            plan_repair_retry(model::Kind::Node, false),
+            vec![
+                RepairStep::NodeUninstall,
+                RepairStep::ScStop,
+                RepairStep::ScDelete,
+                RepairStep::NodeInstall,
+                RepairStep::ScStart
+            ]
+        );
+    }
+
+    #[test]
+    fn 退出码3只在后端全部健康时给出() {
+        // D3 + README: 3 的含义是"后端健康, 别动后端, 去查 nginx"。
+        // 混合场景 (一条路由要修后端 + 一条回环告警) 若报 3, 按退出码分诊的脚本
+        // 会跳过本该执行的后端修复。
+        assert_eq!(overall_exit(&[1, 3], 5), 1);
+        assert_eq!(overall_exit(&[0, 3], 1), 3);
+        assert_eq!(overall_exit(&[0, 0], 2), 1);
+        assert_eq!(overall_exit(&[0], 0), 0);
+        assert_eq!(overall_exit(&[], 0), 0);
+    }
+
+    #[test]
+    fn 端到端未验证时不得宣布三层全通过() {
+        use model::{L1, L2, L3};
+        let row = |l3: Option<L3>| RouteRow {
+            path: "/artemis-web".into(),
+            target: "9017".into(),
+            l1: L1::Listening,
+            l2: Some(L2::Ok(200)),
+            l3,
+        };
+        assert!(layers_all_verified(&[row(Some(L3::Ok(200)))]));
+        // 目标机没有 curl / 握手失败 / 漏归类 / 根本没探 -> 都不算"三层通过"
+        for l3 in [None, Some(L3::Skipped), Some(L3::TlsUnavailable), Some(L3::Raw(200))] {
+            assert!(
+                !layers_all_verified(&[row(l3)]),
+                "L3={:?} 被当成了端到端通过",
+                l3
+            );
+        }
+        assert!(!layers_all_verified(&[]));
     }
 
     fn argv(v: &[&str]) -> Vec<String> {
@@ -1171,23 +1298,22 @@ mod tests {
     }
 
     #[test]
-    fn 报告表把不一致行显式标出() {
-        use model::{L1, L2, L3};
+    fn 报告表把不一致行显式标出() {        use model::{L1, L2, L3};
         let t = render_route_table(&[
-            (
-                "/artemis-web".into(),
-                "9017".into(),
-                L1::Listening,
-                Some(L2::Ok(200)),
-                Some(L3::Bad(502)),
-            ),
-            (
-                "/artemis".into(),
-                "9016".into(),
-                L1::NotListening,
-                None,
-                None,
-            ),
+            RouteRow {
+                path: "/artemis-web".into(),
+                target: "9017".into(),
+                l1: L1::Listening,
+                l2: Some(L2::Ok(200)),
+                l3: Some(L3::Bad(502)),
+            },
+            RouteRow {
+                path: "/artemis".into(),
+                target: "9016".into(),
+                l1: L1::NotListening,
+                l2: None,
+                l3: None,
+            },
         ]);
         assert!(t.contains("/artemis-web"), "{}", t);
         assert!(t.contains("502"), "必须显示实际状态码: {}", t);

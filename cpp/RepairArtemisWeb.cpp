@@ -291,14 +291,28 @@ static const char* next_step(VerdictAction a) {
     return "";
 }
 
+// L3 没有真正验过时给出可告知用户的原因; 返回空串表示这层结论可信。
+static const char* unverified_l3_note(const L3& l3) {
+    switch (l3.kind) {
+        case L3Kind::Skipped:
+            return "端到端未执行: 未找到系统 curl.exe 或 --e2e-host 非法";
+        case L3Kind::TlsUnavailable:
+            return "端到端未验证: curl 未能取到状态码 (握手或网络失败)";
+        case L3Kind::Raw_:
+            return "端到端结果未经归类";
+        default:
+            return "";
+    }
+}
+
 // 首次匹配, 顺序即优先级 (与 Rust 的 match 臂顺序逐条对应)。
 // Rust 的 Option<L2>/Option<L3> 在此用 has2/has3 表达。
 static RouteVerdict attribute(L1 l1, bool has2, L2 l2, bool has3, L3 l3) {
     if (l1 == L1::NotListening)
         return { "后端未监听端口", VerdictAction::RepairBackend, 1 };
-    // 行3 端口被非 HTTP 进程占用
+    // 行3 端口被非 HTTP 进程占用 (文案与 Rust model::attribute 逐字一致, 双版本 diff 依赖它)
     if (has2 && l2.kind == L2Kind::NoHttpResponse)
-        return { "端口已被非 HTTP 进程占用", VerdictAction::ReportOccupier, 1 };
+        return { "端口已监听但无 HTTP 响应 (疑被非 HTTP 进程占用)", VerdictAction::ReportOccupier, 1 };
     // 行4 5xx
     if (has2 && l2.kind == L2Kind::ServerError)
         return { "应用已启动但返回 5xx", VerdictAction::ShowLog, 1 };
@@ -786,12 +800,13 @@ static bool valid_e2e_host(const std::string& host) {
     return true;
 }
 
-// 绝对路径定位 System32\curl.exe, 不依赖 PATH 查找 (避免被同名程序劫持)。
+// 系统目录向内核要, 不读 %WINDIR%: 环境变量可被同会话内任何进程改写,
+// 那等于把"用绝对路径避免被同名程序劫持"这一层重新交还给环境 (spec D1b 的原意)。
 static bool curl_exe(fs::path& out) {
-    wchar_t buf[4096];
-    DWORD n = GetEnvironmentVariableW(L"WINDIR", buf, 4095);
-    fs::path win = (n == 0 || n > 4095) ? fs::path(L"C:\\Windows") : fs::path(buf);
-    fs::path p = win / L"System32" / L"curl.exe";
+    wchar_t buf[260];
+    DWORD n = GetSystemDirectoryW(buf, 260);
+    if (n == 0 || n >= 260) return false;
+    fs::path p = fs::path(buf) / L"curl.exe";
     std::error_code ec;
     if (!fs::is_regular_file(p, ec)) return false;
     out = p;
@@ -987,8 +1002,9 @@ static std::map<std::string, std::string> parse_properties(const std::string& te
                 if (eq != std::string::npos) {
                     std::string key = trim_ws(line.substr(0, eq));
                     size_t vb = line.find_first_not_of(" \t", eq + 1);
+                    // 值只去首尾空白, 内部空格与后续 = 原样保留
                     std::string value =
-                        (vb == std::string::npos) ? std::string() : line.substr(vb);
+                        (vb == std::string::npos) ? std::string() : rtrim(line.substr(vb));
                     if (!key.empty()) m[key] = value;
                 }
             }
@@ -1351,7 +1367,8 @@ static std::vector<RepairStep> plan_repair(Kind kind, SvcState state,
         }
         return v;
     }
-    // Prunsrv: --reinstall 只是"端口起不来时才升级到重装", 不能拿它去重装健康的网关
+    // Prunsrv: 装不重装由 plan_repair_retry 在"端口仍未起"之后决定,
+    // 这里塞进同一阶梯会让它紧跟 restart 执行 (D2 的保守一级就丢了)
     if (state == SvcState::Running && l1_up) return v;
     if (state == SvcState::Missing) {
         v.push_back(RepairStep::PrunsrvInstall);
@@ -1360,9 +1377,37 @@ static std::vector<RepairStep> plan_repair(Kind kind, SvcState state,
         v.push_back(RepairStep::ScStart);
     } else {
         v.push_back(RepairStep::PrunsrvRestart);
-        if (reinstall) v.push_back(RepairStep::PrunsrvReinstall);
     }
     return v;
+}
+
+// 纯函数: 第一阶梯失败后允许升级到什么 (与 Rust plan_repair_retry 对齐)。
+static std::vector<RepairStep> plan_repair_retry(Kind kind, bool reinstall) {
+    std::vector<RepairStep> v;
+    if (kind == Kind::Node) {
+        // spec §6: Node 沿用既有流程 —— 启动不成就卸载重装
+        v.push_back(RepairStep::NodeUninstall);
+        v.push_back(RepairStep::ScStop);
+        v.push_back(RepairStep::ScDelete);
+        v.push_back(RepairStep::NodeInstall);
+        v.push_back(RepairStep::ScStart);
+        return v;
+    }
+    if (reinstall) v.push_back(RepairStep::PrunsrvReinstall);
+    return v;
+}
+
+// 各路由贡献的汇总。3 的含义是"后端健康, 别动后端"(D3),
+// 所以只要有一条路由要修后端(1), 整体就不能报 3。
+static int overall_exit(const std::vector<unsigned int>& contribs, unsigned int issues) {
+    bool one = false, three = false;
+    for (unsigned int c : contribs) {
+        if (c == 1) one = true;
+        if (c == 3) three = true;
+    }
+    if (one) return 1;
+    if (three) return 3;
+    return issues > 0 ? 1 : 0;
 }
 
 // ----------------------------------------------------------------------------
@@ -1460,6 +1505,34 @@ static bool confirm(const std::string& prompt) {
 }
 
 // 返回该组件对异常计数的贡献: 0 正常, 1 异常, 3 nginx 层。
+// 执行一组阶梯动作。第一/第二阶梯共用。
+static void run_steps(const std::vector<RepairStep>& steps,
+                      const ResolvedComponent& rc, const fs::path& node_exe) {
+    for (RepairStep s : steps) {
+        switch (s) {
+            case RepairStep::ScStart:
+                logf(Level::Info, "sc start %s", decode_to_utf8(rc.svc_name).c_str());
+                start_service(rc.svc_name);
+                break;
+            case RepairStep::ScStop:   stop_service(rc.svc_name); break;
+            case RepairStep::ScDelete: delete_service(rc.svc_name); break;
+            case RepairStep::NodeUninstall:
+                run_node_logged(node_exe, rc.dir / L"service.uninstall.js", nullptr, "uninstall");
+                break;
+            case RepairStep::NodeInstall:
+                run_node_logged(node_exe, rc.dir / L"service.install.js", &rc.dir, "install");
+                break;
+            case RepairStep::PrunsrvInstall: run_prunsrv_bat(rc.dir, L"install", "prunsrv"); break;
+            case RepairStep::PrunsrvRestart: run_prunsrv_bat(rc.dir, L"restart", "prunsrv"); break;
+            case RepairStep::PrunsrvReinstall:
+                run_prunsrv_bat(rc.dir, L"uninstall", "prunsrv");
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+                run_prunsrv_bat(rc.dir, L"install", "prunsrv");
+                break;
+        }
+    }
+}
+
 static int repair_component(const ResolvedComponent& rc, const fs::path& node_exe,
                             bool reinstall, bool check_only, bool assume_yes,
                             unsigned int& issues) {
@@ -1503,49 +1576,34 @@ static int repair_component(const ResolvedComponent& rc, const fs::path& node_ex
         log(Level::Ok, "无需修复。");
         return 0;
     }
-    if (rc.def->kind == Kind::Prunsrv) {
+    run_steps(steps, rc, node_exe);
+
+    if (!port_listening(rc.port) && !wait_for_port(rc)) {
+        // 第一阶梯没把端口弄起来 -> 才允许考虑升级 (spec §6 步骤 4)
+        std::vector<RepairStep> retry = plan_repair_retry(rc.def->kind, reinstall);
         bool wants_reinstall = false;
-        for (RepairStep s : steps)
+        for (RepairStep s : retry)
             if (s == RepairStep::PrunsrvReinstall) wants_reinstall = true;
-        if (wants_reinstall && !assume_yes
-            && !confirm("即将卸载并重装 Java 网关服务 "
+        bool refused = wants_reinstall && !assume_yes
+            && !confirm("restart 后端口 " + std::to_string(rc.port)
+                        + " 仍未监听。即将卸载并重装 Java 网关服务 "
                         + decode_to_utf8(rc.svc_name)
-                        + " (影响整个 OpenAPI 平台), 确认? [y/N]")) {
-            log(Level::Warn, "用户取消网关重装。");
+                        + " (影响整个 OpenAPI 平台), 确认? [y/N]");
+        if (retry.empty() || refused) {
+            if (refused) log(Level::Warn, "用户取消网关重装。");
+            logf(Level::Err, "[%s] 修复失败: 端口 %u 未监听。", rc.def->key, rc.port);
+            dump_component_logs(rc);
             ++issues;
             return 1;
         }
-    }
-
-    for (RepairStep s : steps) {
-        switch (s) {
-            case RepairStep::ScStart:
-                logf(Level::Info, "sc start %s", decode_to_utf8(rc.svc_name).c_str());
-                start_service(rc.svc_name);
-                break;
-            case RepairStep::ScStop:   stop_service(rc.svc_name); break;
-            case RepairStep::ScDelete: delete_service(rc.svc_name); break;
-            case RepairStep::NodeUninstall:
-                run_node_logged(node_exe, rc.dir / L"service.uninstall.js", nullptr, "uninstall");
-                break;
-            case RepairStep::NodeInstall:
-                run_node_logged(node_exe, rc.dir / L"service.install.js", &rc.dir, "install");
-                break;
-            case RepairStep::PrunsrvInstall: run_prunsrv_bat(rc.dir, L"install", "prunsrv"); break;
-            case RepairStep::PrunsrvRestart: run_prunsrv_bat(rc.dir, L"restart", "prunsrv"); break;
-            case RepairStep::PrunsrvReinstall:
-                run_prunsrv_bat(rc.dir, L"uninstall", "prunsrv");
-                std::this_thread::sleep_for(std::chrono::seconds(3));
-                run_prunsrv_bat(rc.dir, L"install", "prunsrv");
-                break;
+        logf(Level::Warn, "[%s] 端口仍未监听, 升级到第二阶梯", rc.def->key);
+        run_steps(retry, rc, node_exe);
+        if (!port_listening(rc.port) && !wait_for_port(rc)) {
+            logf(Level::Err, "[%s] 修复失败: 端口 %u 未监听。", rc.def->key, rc.port);
+            dump_component_logs(rc);
+            ++issues;
+            return 1;
         }
-    }
-
-    if (!port_listening(rc.port) && !wait_for_port(rc)) {
-        logf(Level::Err, "[%s] 修复失败: 端口 %u 未监听。", rc.def->key, rc.port);
-        dump_component_logs(rc);
-        ++issues;
-        return 1;
     }
     L2 l2 = http_probe_against(rc.port, ws2utf8(rc.pathname), rc.def->l2_ok);
     RouteVerdict v = attribute(L1::Listening, true, l2, false, nol3);
@@ -1700,9 +1758,20 @@ static std::string render_route_table(const std::vector<RouteRow>& rows) {
     return s;
 }
 
+// spec §13.3: 端到端必须真的验过并通过, 才允许宣布"修复成功" (与 Rust 同名函数对齐)。
+static bool layers_all_verified(const std::vector<RouteRow>& rows) {
+    if (rows.empty()) return false;
+    for (const RouteRow& r : rows) {
+        if (attribute(r.l1, r.has2, r.l2, r.has3, r.l3).exit_contrib != 0) return false;
+        if (!r.has3 || r.l3.kind != L3Kind::Ok) return false;
+    }
+    return true;
+}
+
 static int run_flow(const Options& opts) {
     unsigned int issues = 0;
-    unsigned int exit_max = 0;
+    // 每条路由/每个组件对退出码的贡献, 最后由 overall_exit 汇总
+    std::vector<unsigned int> contribs;
     bool check_only = opts.check_only;
     bool reinstall = opts.reinstall;
 
@@ -1793,7 +1862,7 @@ static int run_flow(const Options& opts) {
             log(Level::Err,
                 "$artemis 非 \"local\": /artemis* 会回环到 nginx 自身 "
                 "(https_artemis_remote=127.0.0.1:443), 后端服务无需重启");
-            exit_max = 3;
+            contribs.push_back(3);
             ++issues;
         }
     } else {
@@ -1806,9 +1875,8 @@ static int run_flow(const Options& opts) {
         for (const ComponentDef& def : COMPONENTS) {
             if (key != def.key) continue;
             ResolvedComponent rc = resolve_component(def, root);
-            int contrib = repair_component(rc, node, reinstall, check_only,
-                                           opts.assume_yes, issues);
-            if ((unsigned)contrib > exit_max) exit_max = (unsigned)contrib;
+            contribs.push_back((unsigned int)repair_component(
+                rc, node, reinstall, check_only, opts.assume_yes, issues));
             selected.push_back(rc);
         }
     }
@@ -1836,40 +1904,41 @@ static int run_flow(const Options& opts) {
             row.has3 = true;
             row.l3 = classify_l3(raw, rc.def->l2_ok, nginx_up);
         }
-        RouteVerdict v = attribute(row.l1, row.has2, row.l2, row.has3, row.l3);
-        if (v.exit_contrib > exit_max) exit_max = v.exit_contrib;
         rows.push_back(row);
     }
     if (!rows.empty()) {
         log(Level::Step, "==== 路由归因表 ====");
         std::string table = render_route_table(rows);
         for (const std::string& line : split_lines(table)) log(Level::Info, line);
-        // 归因表只给结论, 下面逐条给下一步; 端口在听但没 HTTP 响应时把占用者 PID 一起报出来
-        for (const RouteRow& r : rows) {
-            RouteVerdict v = attribute(r.l1, r.has2, r.l2, r.has3, r.l3);
-            if (v.exit_contrib == 0) continue;
-            const char* hint = next_step(v.action);
-            if (r.has2 && r.l2.kind == L2Kind::NoHttpResponse) {
-                unsigned short port = (unsigned short)std::strtoul(r.target.c_str(), nullptr, 10);
-                unsigned long pid = 0;
-                if (port_owner_pid(port, pid)) {
-                    logf(Level::Warn, "%s: 占用进程 PID=%lu%s%s",
-                         r.path.c_str(), pid, hint[0] ? " | " : "", hint);
-                    continue;
-                }
-            }
-            if (hint[0]) logf(Level::Warn, "%s: %s", r.path.c_str(), hint);
+    }
+    for (const RouteRow& r : rows) {
+        RouteVerdict v = attribute(r.l1, r.has2, r.l2, r.has3, r.l3);
+        contribs.push_back(v.exit_contrib);
+        // 端到端这一层没真验过: 静默降级会让人以为三层都查过了 (spec D1b)。
+        // --no-e2e 是用户主动跳过的, 不该被说成"找不到 curl"。
+        if (opts.e2e) {
+            const char* why = unverified_l3_note(r.l3);
+            if (why[0]) logf(Level::Warn, "%s: %s", r.path.c_str(), why);
         }
+        if (v.exit_contrib == 0 && v.action == VerdictAction::None_) continue;
+        // 归因表只给结论, 下面逐条给下一步; 端口在听但没 HTTP 响应时把占用者 PID 一起报出来
+        const char* hint = next_step(v.action);
+        if (r.has2 && r.l2.kind == L2Kind::NoHttpResponse) {
+            unsigned short port = (unsigned short)std::strtoul(r.target.c_str(), nullptr, 10);
+            unsigned long pid = 0;
+            if (port_owner_pid(port, pid)) {
+                logf(Level::Warn, "%s: 占用进程 PID=%lu%s%s",
+                     r.path.c_str(), pid, hint[0] ? " | " : "", hint);
+                continue;
+            }
+        }
+        if (hint[0]) logf(Level::Warn, "%s: %s", r.path.c_str(), hint);
     }
 
     // == 7. 汇总 ==
     log(Level::Step, "==== 汇总 ====");
-    // spec §13.3: 只有 L1+L2+L3 全部通过才说"修复成功"
-    bool all_pass = !rows.empty();
-    for (const RouteRow& r : rows) {
-        if (attribute(r.l1, r.has2, r.l2, r.has3, r.l3).exit_contrib != 0) all_pass = false;
-    }
-    if (!check_only && all_pass) {
+    // spec §13.3: 端到端必须真的验过并通过, 才允许宣布"修复成功"
+    if (!check_only && layers_all_verified(rows)) {
         log(Level::Ok, "修复成功: 全部路由的 L1/L2/L3 三层均通过。");
     }
     if (check_only) {
@@ -1877,8 +1946,7 @@ static int run_flow(const Options& opts) {
     } else {
         logf(Level::Info, "修复流程完成。异常项: %u", issues);
     }
-    if (issues > 0 && exit_max < 3) return 1;
-    return (int)exit_max;
+    return overall_exit(contribs, issues);
 }
 
 // 交互菜单: 返回 Action 值; -1 = 退出

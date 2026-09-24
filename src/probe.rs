@@ -135,7 +135,8 @@ pub fn classify_l3(raw: L3, set: &StatusSet, nginx_up: bool) -> L3 {
 // 一类失败没有对应的忽略位。详见 spec D1b。
 
 use crate::model::L3;
-use std::env;
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
 use std::process::Command;
 
 /// curl 的 -w 输出 -> L3。"000" 是 curl 拿不到任何 HTTP 响应时的固定输出。
@@ -154,9 +155,34 @@ pub fn valid_e2e_host(host: &str) -> bool {
         && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
 }
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetSystemDirectoryW(buf: *mut u16, size: u32) -> u32;
+}
+
+/// 系统目录向内核要, 不读 %WINDIR%: 环境变量可被同一会话内的任何进程改写,
+/// 那等于把"用绝对路径避免被同名程序劫持"这一层重新交还给环境 (spec D1b 的原意)。
+fn system32_dir() -> Option<std::path::PathBuf> {
+    unsafe {
+        let mut buf = [0u16; 260];
+        let mut n = GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32);
+        if n == 0 {
+            return None;
+        }
+        if n as usize > buf.len() {
+            let mut big = vec![0u16; n as usize + 1];
+            n = GetSystemDirectoryW(big.as_mut_ptr(), big.len() as u32);
+            if n == 0 || n as usize > big.len() {
+                return None;
+            }
+            return Some(std::path::PathBuf::from(OsString::from_wide(&big[..n as usize])));
+        }
+        Some(std::path::PathBuf::from(OsString::from_wide(&buf[..n as usize])))
+    }
+}
+
 fn curl_exe() -> Option<std::path::PathBuf> {
-    let dir = env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_string());
-    let p = std::path::Path::new(&dir).join("System32").join("curl.exe");
+    let p = system32_dir()?.join("curl.exe");
     if p.is_file() {
         Some(p)
     } else {
