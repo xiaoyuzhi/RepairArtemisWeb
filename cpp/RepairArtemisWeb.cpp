@@ -41,6 +41,7 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -941,6 +942,306 @@ static RouteVerdict attribute(L1 l1, bool has2, L2 l2, bool has3, L3 l3) {
     if (has2 && l2.kind == L2Kind::Ok)
         return { "正常", VerdictAction::None_, 0 };
     return { "后端未响应, 探针未取到结果", VerdictAction::RepairBackend, 1 };
+}
+
+// ----------------------------------------------------------------------------
+// nginx 配置只读解析 (与 Rust nginx::* 对齐, spec §7)
+// 不修改、不 reload、不递归展开 include。
+// ----------------------------------------------------------------------------
+struct Upstream {
+    std::string name, host;
+    unsigned short port;
+};
+
+enum class RouteTargetKind { Upstream_, Dynamic, None_ };
+struct Route {
+    std::string path;
+    RouteTargetKind target;
+    std::string upstream;  // 仅 target == Upstream_ 时有值
+};
+
+struct NginxInfo {
+    fs::path root;
+    std::vector<Upstream> upstreams;
+    std::vector<Route> routes;
+    std::string artemis_mode;      // 空 = 未读到
+    std::string artemis_mode_loc;
+
+    // $artemis != "local" 时 /artemis* 落到 https_artemis_remote (127.0.0.1:443), 即 nginx 自身
+    bool loopback_risk() const {
+        if (artemis_mode.empty() || artemis_mode == "local") return false;
+        for (const Upstream& u : upstreams)
+            if (u.name == "https_artemis_remote" && u.port == 443) return true;
+        return false;
+    }
+};
+
+static std::string strip_comment(const std::string& line) {
+    size_t h = line.find('#');
+    return (h == std::string::npos) ? line : line.substr(0, h);
+}
+
+static std::string ltrim(const std::string& s) {
+    size_t b = s.find_first_not_of(" \t");
+    return b == std::string::npos ? std::string() : s.substr(b);
+}
+static std::string rtrim(const std::string& s) {
+    size_t e = s.find_last_not_of(" \t");
+    return e == std::string::npos ? std::string() : s.substr(0, e + 1);
+}
+static std::string trim(const std::string& s) { return ltrim(rtrim(s)); }
+
+static std::vector<std::string> split_lines(const std::string& text) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    while (true) {
+        size_t nl = text.find('\n', pos);
+        if (nl == std::string::npos) {
+            if (pos < text.size()) out.push_back(text.substr(pos));
+            break;
+        }
+        out.push_back(text.substr(pos, nl - pos));
+        pos = nl + 1;
+    }
+    for (std::string& s : out)
+        if (!s.empty() && s.back() == '\r') s.pop_back();
+    return out;
+}
+
+static bool starts_with(const std::string& s, const char* p) {
+    size_t n = std::strlen(p);
+    return s.size() >= n && s.compare(0, n, p) == 0;
+}
+static bool is_all_digits(const std::string& s) {
+    if (s.empty()) return false;
+    for (char c : s) if (c < '0' || c > '9') return false;
+    return true;
+}
+
+static std::vector<Upstream> parse_upstreams(const std::string& text) {
+    std::vector<Upstream> out;
+    std::vector<std::string> lines = split_lines(text);
+    size_t i = 0;
+    while (i < lines.size()) {
+        std::string t = trim(strip_comment(lines[i]));
+        ++i;
+        if (!starts_with(t, "upstream")) continue;
+        std::string rest = t.substr(8);
+        if (!rest.empty()) {
+            char f = ltrim(rest).empty() ? ' ' : ltrim(rest)[0];
+            if (std::isalnum((unsigned char)f)) continue;
+        }
+        rest = ltrim(rest);
+        std::string name;
+        for (char c : rest) {
+            if (c == '{' || c == ' ' || c == '\t') break;
+            name += c;
+        }
+        if (name.empty()) continue;
+        int depth = (int)std::count(t.begin(), t.end(), '{')
+                  - (int)std::count(t.begin(), t.end(), '}');
+        std::string body = rest;
+        while (i < lines.size() && depth > 0) {
+            std::string c = strip_comment(lines[i]);
+            depth += (int)std::count(c.begin(), c.end(), '{')
+                   - (int)std::count(c.begin(), c.end(), '}');
+            body += "\n";
+            body += c;
+            ++i;
+        }
+        for (const std::string& bl : split_lines(body)) {
+            std::string bt = trim(bl);
+            if (!starts_with(bt, "server")) continue;
+            std::string a = trim(rtrim(bt.substr(6)));
+            if (!a.empty() && a.back() == ';') a.pop_back();
+            a = trim(a);
+            size_t colon = a.find_last_of(':');
+            if (colon == std::string::npos) continue;
+            std::string pstr = trim(a.substr(colon + 1));
+            if (!is_all_digits(pstr)) continue;
+            unsigned long pv = std::strtoul(pstr.c_str(), nullptr, 10);
+            if (pv == 0 || pv > 65535) continue;
+            Upstream u;
+            u.name = name;
+            u.host = trim(a.substr(0, colon));
+            u.port = (unsigned short)pv;
+            out.push_back(u);
+            break;
+        }
+    }
+    return out;
+}
+
+// 花括号配对计数提取 location 块 (Review Focus #3)。
+static std::vector<Route> parse_locations(const std::string& text) {
+    std::vector<Route> out;
+    std::vector<std::string> lines = split_lines(text);
+    size_t i = 0;
+    while (i < lines.size()) {
+        std::string t = trim(strip_comment(lines[i]));
+        ++i;
+        if (!starts_with(t, "location")) continue;
+        std::string rest = t.substr(8);
+        std::string lr = ltrim(rest);
+        if (!lr.empty() && std::isalnum((unsigned char)lr[0])) continue;
+        std::string path;
+        {
+            std::istringstream ss(rest);
+            std::string tk;
+            while (ss >> tk) {
+                if (tk == "^~" || tk == "~" || tk == "~*" || tk == "="
+                    || (!tk.empty() && tk[0] == '~'))
+                    continue;
+                while (!tk.empty() && tk.back() == '{') tk.pop_back();
+                path = tk;
+                break;
+            }
+        }
+        if (path.empty()) continue;
+        int depth = (int)std::count(t.begin(), t.end(), '{')
+                  - (int)std::count(t.begin(), t.end(), '}');
+        std::string body;
+        while (i < lines.size() && depth > 0) {
+            std::string c = strip_comment(lines[i]);
+            depth += (int)std::count(c.begin(), c.end(), '{')
+                   - (int)std::count(c.begin(), c.end(), '}');
+            body += c;
+            body += "\n";
+            ++i;
+        }
+        Route r;
+        r.path = path;
+        r.target = RouteTargetKind::None_;
+        for (const std::string& bl : split_lines(body)) {
+            std::string bt = trim(bl);
+            if (!starts_with(bt, "proxy_pass")) continue;
+            std::string a = trim(rtrim(bt.substr(10)));
+            if (!a.empty() && a.back() == ';') a.pop_back();
+            a = trim(a);
+            if (a.find('$') != std::string::npos) {
+                r.target = RouteTargetKind::Dynamic;
+                break;
+            }
+            size_t sl = a.find_last_of('/');
+            if (sl != std::string::npos && sl + 1 < a.size()) {
+                r.upstream = a.substr(sl + 1);
+                r.target = RouteTargetKind::Upstream_;
+                break;
+            }
+        }
+        out.push_back(r);
+    }
+    return out;
+}
+
+static bool find_artemis_mode(const std::string& text, const std::string& file,
+                              std::string& value, std::string& loc) {
+    std::vector<std::string> lines = split_lines(text);
+    for (size_t n = 0; n < lines.size(); ++n) {
+        std::string t = trim(strip_comment(lines[n]));
+        if (!starts_with(t, "set")) continue;
+        std::istringstream ss(ltrim(t.substr(3)));
+        std::string var, val;
+        if (!(ss >> var)) continue;
+        if (var != "$artemis") continue;
+        std::string rest;
+        std::getline(ss, rest);
+        rest = trim(rest);
+        if (!rest.empty() && rest.back() == ';') rest.pop_back();
+        rest = trim(rest);
+        while (rest.size() >= 2 && rest.front() == '"' && rest.back() == '"')
+            rest = rest.substr(1, rest.size() - 2);
+        value = rest;
+        char b[64];
+        snprintf(b, sizeof(b), "%s:%u", file.c_str(), (unsigned)(n + 1));
+        loc = b;
+        return true;
+    }
+    return false;
+}
+
+static std::vector<fs::path> confs_in(const fs::path& dir) {
+    std::vector<fs::path> v;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+        const fs::path p = e.path();
+        if (fs::is_regular_file(p) && p.extension() == L".conf") v.push_back(p);
+    }
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
+// root 为 nginx 根目录 (含 conf/)。spec §7.3: 只扫 conf/、conf/Mode/、../ssl/ 三处。
+static NginxInfo load_nginx_info(const fs::path& root) {
+    NginxInfo info;
+    info.root = root;
+    fs::path conf = root / L"conf";
+    std::vector<fs::path> files;
+    for (const fs::path& p : confs_in(conf)) files.push_back(p);
+    for (const fs::path& p : confs_in(conf / L"Mode")) files.push_back(p);
+    for (const fs::path& p : confs_in(root / L".." / L"ssl")) files.push_back(p);
+
+    std::string main_txt = read_file_narrow(conf / L"nginx.conf");
+    if (!main_txt.empty()) {
+        info.upstreams = parse_upstreams(main_txt);
+        info.routes = parse_locations(main_txt);
+    }
+    for (const fs::path& f : files) {
+        std::string text = read_file_narrow(f);
+        if (text.empty()) continue;
+        for (const Route& r : parse_locations(text)) {
+            bool dup = false;
+            for (const Route& e : info.routes) if (e.path == r.path) { dup = true; break; }
+            if (!dup) info.routes.push_back(r);
+        }
+        if (info.artemis_mode.empty()) {
+            std::string val, loc;
+            if (find_artemis_mode(text, f.filename().string(), val, loc)) {
+                info.artemis_mode = val;
+                info.artemis_mode_loc = loc;
+            }
+        }
+    }
+    return info;
+}
+
+// 路由 -> 目标端口。remote 模式下 local 分支失效, 落到 remote upstream。
+static bool resolve_route_port(const NginxInfo& info, const std::string& path,
+                               unsigned short& out) {
+    const Route* hit = nullptr;
+    for (const Route& r : info.routes) if (r.path == path) { hit = &r; break; }
+    if (!hit || hit->target != RouteTargetKind::Upstream_) return false;
+    if (info.loopback_risk()) {
+        for (const Upstream& u : info.upstreams)
+            if (u.name == "https_artemis_remote") { out = u.port; return true; }
+        return false;
+    }
+    for (const Upstream& u : info.upstreams)
+        if (u.name == hit->upstream) { out = u.port; return true; }
+    return false;
+}
+
+// 在 base 下查找含 conf/nginx.conf 的目录, 写入 out (nginx 根)。
+static bool locate_nginx_conf(const fs::path& base, fs::path& out) {
+    std::vector<fs::path> stack;
+    std::error_code ec;
+    stack.push_back(base);
+    while (!stack.empty()) {
+        fs::path dir = stack.back();
+        stack.pop_back();
+        for (const auto& e : fs::directory_iterator(dir, ec)) {
+            if (ec) break;
+            const fs::path p = e.path();
+            std::error_code e2;
+            if (!fs::is_directory(p, e2)) continue;
+            if (fs::is_regular_file(p / L"conf" / L"nginx.conf", e2)) {
+                out = p;
+                return true;
+            }
+            stack.push_back(p);
+        }
+    }
+    return false;
 }
 
 // ----------------------------------------------------------------------------
