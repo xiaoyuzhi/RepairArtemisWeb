@@ -260,7 +260,7 @@ struct L2 {
     unsigned short code;  // NoHttpResponse 时无意义
 };
 
-enum class L3Kind { Ok, Bad, TlsUnavailable, NginxDown, Skipped };
+enum class L3Kind { Raw_, Ok, Bad, TlsUnavailable, NginxDown, Skipped };
 struct L3 {
     L3Kind kind;
     unsigned short code;  // 仅 Ok/Bad 有意义
@@ -292,6 +292,9 @@ static RouteVerdict attribute(L1 l1, bool has2, L2 l2, bool has3, L3 l3) {
     if (has2 && l2.kind == L2Kind::Ok && has3
         && (l3.kind == L3Kind::Bad || l3.kind == L3Kind::NginxDown))
         return { "后端健康, nginx 转发层故障", VerdictAction::NginxAttrib, 3 };
+    // 防御: 调用方漏归类时不得把 Raw 当成正常, 也不能当成 nginx 故障
+    if (has2 && l2.kind == L2Kind::Ok && has3 && l3.kind == L3Kind::Raw_)
+        return { "端到端结果未经归类", VerdictAction::Unverifiable, 0 };
     // Review Focus #4: TLS 不可用不得判成后端或 nginx 故障
     if (has2 && l2.kind == L2Kind::Ok && has3 && l3.kind == L3Kind::TlsUnavailable)
         return { "端到端无法验证 (TLS 层不可用)", VerdictAction::Unverifiable, 0 };
@@ -734,6 +737,70 @@ static L2 http_probe_against(unsigned short port, const std::string& pathname,
     unsigned short code = 0;
     if (!parse_status_line(line, code)) return fail;
     return classify(code, set);
+}
+
+// ----------------------------------------------------------------------------
+// L3: 经本机 nginx 443 的端到端验收 (spec §6 L3 / 决策 D1b)
+// 原 WinHTTP 方案被实测推翻, 详见 spec D1b。
+// ----------------------------------------------------------------------------
+
+// curl 的 -w 输出 -> L3。"000" 是 curl 拿不到任何 HTTP 响应时的固定输出。
+static L3 parse_curl_output(bool exit_ok, const std::string& stdout_text) {
+    L3 r; r.kind = L3Kind::TlsUnavailable; r.code = 0;
+    std::string t = trim(stdout_text);
+    if (t.empty() || !is_all_digits(t)) return r;
+    unsigned long v = std::strtoul(t.c_str(), nullptr, 10);
+    if (v == 0 || v > 65535 || !exit_ok) return r;
+    r.kind = L3Kind::Raw_;
+    r.code = (unsigned short)v;
+    return r;
+}
+
+// host 必须是裸主机名/IP。首字符为 '-' 会被 curl 当成选项, 元字符一律拒绝。
+static bool valid_e2e_host(const std::string& host) {
+    if (host.empty() || host[0] == '-') return false;
+    for (char c : host) {
+        bool ok = std::isalnum((unsigned char)c) || c == '.' || c == '-' || c == ':';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// 绝对路径定位 System32\curl.exe, 不依赖 PATH 查找 (避免被同名程序劫持)。
+static bool curl_exe(fs::path& out) {
+    wchar_t buf[4096];
+    DWORD n = GetEnvironmentVariableW(L"WINDIR", buf, 4095);
+    fs::path win = (n == 0 || n > 4095) ? fs::path(L"C:\\Windows") : fs::path(buf);
+    fs::path p = win / L"System32" / L"curl.exe";
+    std::error_code ec;
+    if (!fs::is_regular_file(p, ec)) return false;
+    out = p;
+    return true;
+}
+
+// 443 未监听 -> NginxDown; 否则按期望集合归类。5xx 与非期望一律 Bad。
+static L3 classify_l3(L3 raw, const StatusSet& set, bool nginx_up) {
+    if (raw.kind == L3Kind::Raw_ && !nginx_up) { raw.kind = L3Kind::NginxDown; return raw; }
+    if (raw.kind == L3Kind::TlsUnavailable && !nginx_up) { raw.kind = L3Kind::NginxDown; return raw; }
+    if (raw.kind != L3Kind::Raw_) return raw;
+    unsigned short c = raw.code;
+    raw.kind = ((c >= 500 && c < 600) || !set.accepts(c)) ? L3Kind::Bad : L3Kind::Ok;
+    return raw;
+}
+
+// 经 nginx 443 取真实状态码。curl 缺失或 host 非法 -> Skipped (降级, 不伪造)。
+static L3 https_probe(const std::string& host, unsigned short port, const std::string& pathname) {
+    L3 r; r.kind = L3Kind::TlsUnavailable; r.code = 0;
+    fs::path exe;
+    if (!curl_exe(exe)) { r.kind = L3Kind::Skipped; return r; }
+    if (!valid_e2e_host(host)) { r.kind = L3Kind::Skipped; return r; }
+    std::string url = "https://" + host + ":" + std::to_string(port) + pathname;
+    RunRes res = run_output(exe.wstring(),
+                            { L"-s", L"-k", L"-o", L"NUL", L"-m", L"10",
+                              L"-w", L"%{http_code}", ascii_value_to_wide(url) },
+                            nullptr);
+    if (!res.launched) return r;
+    return parse_curl_output(res.exitCode == 0, res.out);
 }
 
 // ----------------------------------------------------------------------------

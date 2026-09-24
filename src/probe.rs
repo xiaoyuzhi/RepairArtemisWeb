@@ -116,6 +116,7 @@ pub fn http_probe_against(port: u16, pathname: &str, set: &StatusSet) -> L2 {
 pub fn classify_l3(raw: L3, set: &StatusSet, nginx_up: bool) -> L3 {
     match raw {
         L3::Raw(_) if !nginx_up => L3::NginxDown,
+        L3::TlsUnavailable if !nginx_up => L3::NginxDown,
         L3::Raw(c) => {
             if (500..600).contains(&c) || !set.accepts(c) {
                 L3::Bad(c)
@@ -127,115 +128,70 @@ pub fn classify_l3(raw: L3, set: &StatusSet, nginx_up: bool) -> L3 {
     }
 }
 
-// ---- WinHTTP FFI (无 crate; 端到端 HTTPS 验收, spec §6 L3 / 决策 D1) --------
+// ---- L3: 经本机 nginx 443 的端到端验收 (spec §6 L3 / 决策 D1b) --------------
+//
+// 原方案是 WinHTTP FFI, 执行期被实测推翻: 对本平台 nginx, WinHttpSendRequest 恒返回
+// 12175, 而同一端点 curl.exe 返回 200; 服务器证书无 CN/无 SAN, WinHTTP 的 INVALID_CA
+// 一类失败没有对应的忽略位。详见 spec D1b。
+
 use crate::model::L3;
-use std::ffi::c_void;
+use std::env;
+use std::process::Command;
 
-#[link(name = "winhttp")]
-extern "system" {
-    fn WinHttpOpen(ua: *const u16, access: u32, proxy: *const u16, bypass: *const u16, flags: u32) -> *mut c_void;
-    fn WinHttpConnect(s: *mut c_void, server: *const u16, port: u16, reserved: u32) -> *mut c_void;
-    fn WinHttpOpenRequest(c: *mut c_void, verb: *const u16, obj: *const u16, ver: *const u16, refr: *const u16, types: *const *const u16, flags: u32) -> *mut c_void;
-    fn WinHttpSetOption(h: *mut c_void, opt: u32, val: *mut c_void, size: u32) -> i32;
-    fn WinHttpSendRequest(r: *mut c_void, headers: *const u16, hlen: u32, data: *mut c_void, dlen: u32, total: u32, ctx: usize) -> i32;
-    fn WinHttpReceiveResponse(r: *mut c_void, reserved: *mut c_void) -> i32;
-    fn WinHttpQueryHeaders(r: *mut c_void, level: u32, name: *const u16, buf: *mut c_void, buflen: *mut u32, idx: *mut u32) -> i32;
-    fn WinHttpCloseHandle(h: *mut c_void) -> i32;
-}
-
-const WT_NO_PROXY: u32 = 1;
-const WT_FLAG_SECURE: u32 = 0x0080_0000;
-const WT_OPT_SECURITY_FLAGS: u32 = 31;
-const WT_QUERY_STATUS_CODE: u32 = 19;
-const WT_QUERY_FLAG_NUMBER: u32 = 0x2000;
-// 忽略自签/域名不符/过期/用途不符: 目标是探状态码, 不是校验证书链
-const SEC_IGNORE_ALL: u32 = 0x0200 | 0x1000 | 0x2000;
-
-fn u16z(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// 经 nginx 443 的端到端验收 (spec §6 L3)。任何 TLS/连接层失败一律返回
-/// TlsUnavailable, 不得伪装成 Bad —— 见 Review Focus #4。
-///
-/// 尚未通过验证 (阻塞中): 对本机 iSecure VMS 的 nginx (nginx.conf 第 284 行
-/// `ssl_protocols TLSv1.1 TLSv1.2;` + `ssl_prefer_server_ciphers on`),
-/// WinHttpSendRequest 一律返回 12175 ERROR_WINHTTP_SECURE_FAILURE, 即使已设置
-/// WINHTTP_OPTION_SECURITY_FLAGS 的全部证书忽略位; 而同一端点 curl.exe 实测 200。
-/// 对公网 TLS 站点本函数可正常收发, 故不是调用序列错误。
-/// 见 ledger "Task 7 阻塞"。决策前不得接入 Task 9。
-pub fn https_probe(host: &str, port: u16, pathname: &str) -> L3 {
-    unsafe {
-        let session = WinHttpOpen(
-            u16z("RepairArtemisWeb").as_ptr(),
-            WT_NO_PROXY,
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-        );
-        if session.is_null() {
-            return L3::TlsUnavailable;
-        }
-        let conn = WinHttpConnect(session, u16z(host).as_ptr(), port, 0);
-        let req = if conn.is_null() {
-            std::ptr::null_mut()
-        } else {
-            WinHttpOpenRequest(
-                conn,
-                u16z("GET").as_ptr(),
-                u16z(pathname).as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
-                WT_FLAG_SECURE,
-            )
-        };
-        if req.is_null() {
-            if !conn.is_null() {
-                WinHttpCloseHandle(conn);
-            }
-            WinHttpCloseHandle(session);
-            return L3::TlsUnavailable;
-        }
-        // 只忽略证书链相关的校验位: 我们要的是状态码, 不是信任判断。
-        // 注意: 不设 WINHTTP_OPTION_SECURE_PROTOCOLS —— 实测设在 session 上会让
-        // WinHttpSendRequest 一律返回 12175 (含对公网正规证书), 设在 request 上返回 12018。
-        // 老平台 (Win7 默认仅 TLS1.0) 握手失败会如实落到 TlsUnavailable, 符合 Review Focus #4。
-        let mut flags: u32 = SEC_IGNORE_ALL;
-        WinHttpSetOption(req, WT_OPT_SECURITY_FLAGS, &mut flags as *mut u32 as *mut c_void, 4);
-
-        let sent = WinHttpSendRequest(req, std::ptr::null(), 0, std::ptr::null_mut(), 0, 0, 0);
-        let got = if sent == 0 { 0 } else { WinHttpReceiveResponse(req, std::ptr::null_mut()) };
-        if got == 0 {
-            WinHttpCloseHandle(req);
-            WinHttpCloseHandle(conn);
-            WinHttpCloseHandle(session);
-            return L3::TlsUnavailable;
-        }
-        let mut code: u32 = 0;
-        let mut size: u32 = std::mem::size_of::<u32>() as u32;
-        let ok = WinHttpQueryHeaders(
-            req,
-            WT_QUERY_STATUS_CODE | WT_QUERY_FLAG_NUMBER,
-            std::ptr::null(),
-            &mut code as *mut u32 as *mut c_void,
-            &mut size,
-            std::ptr::null_mut(),
-        );
-        WinHttpCloseHandle(req);
-        WinHttpCloseHandle(conn);
-        WinHttpCloseHandle(session);
-        if ok == 0 {
-            return L3::TlsUnavailable;
-        }
-        L3::Raw(code as u16)
+/// curl 的 -w 输出 -> L3。"000" 是 curl 拿不到任何 HTTP 响应时的固定输出。
+pub fn parse_curl_output(exit_ok: bool, stdout: &str) -> L3 {
+    let code = stdout.trim();
+    match code.parse::<u16>() {
+        Ok(c) if c != 0 && exit_ok => L3::Raw(c),
+        _ => L3::TlsUnavailable,
     }
+}
+
+/// host 必须是裸主机名/IP。首字符为 '-' 会被 curl 当成选项, 空白与元字符一律拒绝。
+pub fn valid_e2e_host(host: &str) -> bool {
+    !host.is_empty()
+        && !host.starts_with('-')
+        && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
+}
+
+fn curl_exe() -> Option<std::path::PathBuf> {
+    let dir = env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let p = std::path::Path::new(&dir).join("System32").join("curl.exe");
+    if p.is_file() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// 经 nginx 443 取真实状态码。curl 缺失或 host 非法 -> Skipped (降级, 不伪造)。
+pub fn https_probe(host: &str, port: u16, pathname: &str) -> L3 {
+    let exe = match curl_exe() {
+        Some(e) => e,
+        None => return L3::Skipped,
+    };
+    if !valid_e2e_host(host) {
+        return L3::Skipped;
+    }
+    let url = format!("https://{}:{}{}", host, port, pathname);
+    // 绝对路径调用 + 不经 shell, 参数以数组传入, 无注入面
+    let out = match Command::new(&exe)
+        .args(["-s", "-k", "-o", "NUL", "-m", "10", "-w", "%{http_code}"])
+        .arg(&url)
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return L3::TlsUnavailable,
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    parse_curl_output(out.status.success(), &stdout)
 }
 
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
-    use super::*;    use crate::model::{L2, StatusSet};
+    use super::*;
+    use crate::model::{L2, StatusSet};
 
     #[test]
     fn netstat行解析只认LISTENING并取PID() {
@@ -297,5 +253,42 @@ mod tests {
         use crate::model::{attribute, L1, L2, L3, VerdictAction};
         let v = attribute(L1::Listening, Some(L2::Ok(200)), Some(L3::Raw(200)));
         assert_eq!(v.action, VerdictAction::Unverifiable);
+    }
+
+    // ---- Task 7b: L3 改由 curl.exe 承载 (spec D1b) ----
+
+    #[test]
+    fn curl输出解析成L3() {
+        assert_eq!(parse_curl_output(true, "200"), L3::Raw(200));
+        assert_eq!(parse_curl_output(true, "302"), L3::Raw(302));
+        assert_eq!(parse_curl_output(true, "502"), L3::Raw(502));
+        // 末尾换行与空白不得影响判定
+        assert_eq!(parse_curl_output(true, "200\n"), L3::Raw(200));
+        // curl 拿不到任何 HTTP 响应时打印 000
+        assert_eq!(parse_curl_output(true, "000"), L3::TlsUnavailable);
+        assert_eq!(parse_curl_output(false, "000"), L3::TlsUnavailable);
+        assert_eq!(parse_curl_output(true, ""), L3::TlsUnavailable);
+        assert_eq!(parse_curl_output(true, "garbage"), L3::TlsUnavailable);
+    }
+
+    #[test]
+    fn host必须白名单校验否则跳过() {
+        // 以 '-' 开头会被 curl 当成命令行选项; 空白与 shell 元字符一律拒绝
+        assert!(valid_e2e_host("127.0.0.1"));
+        assert!(valid_e2e_host("localhost"));
+        assert!(valid_e2e_host("192.168.1.10"));
+        assert!(!valid_e2e_host("-o"));
+        assert!(!valid_e2e_host("a b"));
+        assert!(!valid_e2e_host(""));
+        assert!(!valid_e2e_host("127.0.0.1;calc"));
+        assert!(!valid_e2e_host("127.0.0.1/x"));
+    }
+
+    #[test]
+    fn 端口四四三未监听时TLS失败也归为nginx未起() {
+        // spec D1b: curl 不可用/握手失败时, 若 443 本就没起来, 结论应是 nginx 未就绪
+        assert_eq!(classify_l3(L3::TlsUnavailable, &StatusSet::WEB, false), L3::NginxDown);
+        // 但 --no-e2e 的 Skipped 不能被改写成结论
+        assert_eq!(classify_l3(L3::Skipped, &StatusSet::WEB, false), L3::Skipped);
     }
 }

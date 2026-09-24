@@ -109,17 +109,34 @@ if ($artemis = "remote") { proxy_pass https://https_artemis_remote; }
 
 ### D1 端到端 HTTPS 用 WinHTTP，不用 curl.exe
 
+> **2026-09-25 执行期推翻，见 D1b。以下为原始决策与其理由，保留以记录推理过程。**
+
 G3 要求发 HTTPS 请求到 443 并忽略自签证书。项目宣称"零第三方依赖 / 纯 Rust 标准库"，而 **Rust 标准库没有 TLS 客户端**。候选：
 
 | 方案 | 评估 |
 | --- | --- |
-| **WinHTTP（选定）** | 系统自带 `winhttp.dll`，Vista+；`WINHTTP_OPTION_SECURITY_FLAGS` 可忽略证书校验；不 spawn 进程；C++ 侧 `winhttp.h` 原生，Rust 侧沿用项目既有的 `#[link]` FFI 风格。 |
+| **WinHTTP（原选定）** | 系统自带 `winhttp.dll`，Vista+；`WINHTTP_OPTION_SECURITY_FLAGS` 可忽略证书校验；不 spawn 进程；C++ 侧 `winhttp.h` 原生，Rust 侧沿用项目既有的 `#[link]` FFI 风格。 |
 | 调用 `curl.exe` | System32 确有（Win10 1803+），但 README 声称支持 Windows 7+，且为取一个状态码 spawn 进程不如 FFI 干净。 |
 | 引入 `ureq`/`reqwest` | 直接违反 N4 与项目"零依赖"卖点。排除。 |
 
 Rust 侧需声明：`WinHttpOpen`、`WinHttpConnect`、`WinHttpOpenRequest`、`WinHttpSetOption`、`WinHttpSendRequest`、`WinHttpReceiveResponse`、`WinHttpQueryHeaders`、`WinHttpCloseHandle`。C++ 侧 `cpp/build.bat` 增加 `winhttp.lib`。
 
 Win7 的 WinHTTP 默认只启用 TLS 1.0，故显式设置 `WINHTTP_OPTION_SECURE_PROTOCOLS` 为 TLS1.0|1.1|1.2|1.3 的按位或（不存在的位被拒绝时回退）。
+
+### D1b 执行期改判：端到端 HTTPS 改用 `curl.exe`
+
+Task 7 实现 WinHTTP 后对本机 nginx 实测失败，原决策的两个前提被现场证据推翻：
+
+- **WinHTTP 无法接受目标平台的证书。** `WinHttpSendRequest` 对 `https://127.0.0.1/artemis-web/` 恒返回 `12175 ERROR_WINHTTP_SECURE_FAILURE`，而同一端点 `curl.exe -k` 返回 200。已逐条排除：FFI 传参（同句柄设 `RECEIVE_TIMEOUT` 返回 1）、证书忽略位（`0x3200` 全部生效，加 `0x0080` 反被拒 `87`）、SNI、TLS 版本（openssl 实测 TLS1.2 可握手）、双向认证（服务器未请求客户端证书）、WinHTTP 本身可用性（打公网 TLS 站点收发正常）。关键线索：服务器证书 `subject=C=CN, ST=hangzhou, L=china, O=hikvision, OU=hik` **无 CN 也无 SAN**，而 WinHTTP 的 `INVALID_CA`（证书畸形）一类失败**没有对应的忽略位**，属结构性不可达。
+- **"不 spawn 进程"的收益不抵"拿不到结果"。** L3 的全部价值在于给出经 nginx 的真实状态码；一个恒返回"无法验证"的探针等于没有该层，且会被归因成 `Unverifiable`/退出码 0，静默掉这次要修的核心能力。
+
+修订后的决策：
+
+- L3 通过 `Command` 调用 **绝对路径** `%WINDIR%\System32\curl.exe`（不依赖 PATH 查找，避免被同名程序劫持），参数 `-s -k -o NUL -m 10 -w "%{http_code}" <url>`，不经过 shell。
+- `curl.exe` 不存在（Win7 等）或 host 含非法字符时返回 `L3::Skipped` 并 Warn —— **降级但不伪造**。
+- `classify_l3` 扩展：`TlsUnavailable` 且 443 未监听时同样归为 `NginxDown`。
+- README 的平台下限相应改为"Windows 7+ 可用，但端到端 HTTPS 验收需 Windows 10 1803+（内置 curl）"。
+- WinHTTP 相关 FFI 全部删除，`cpp/build.bat` 不再需要 `winhttp.lib`。
 
 ### D2 网关重装需要显式授权，默认只到 restart
 
