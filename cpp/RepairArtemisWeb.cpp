@@ -736,6 +736,163 @@ static CompConfig read_config(const fs::path& dir) {
 }
 
 // ----------------------------------------------------------------------------
+// 组件描述表 (与 Rust model::Kind / StatusSet / ComponentDef / COMPONENTS 对齐)
+// ----------------------------------------------------------------------------
+enum class Kind { Node, Prunsrv };
+
+// spec §5: 不设"非 5xx 即活"的宽泛规则。
+struct StatusSet {
+    bool two, three, four_zero_four;
+    bool accepts(unsigned short code) const {
+        if (two && code >= 200 && code < 300) return true;
+        if (three && code >= 300 && code < 400) return true;
+        if (four_zero_four && code == 404) return true;
+        return false;
+    }
+};
+static const StatusSet SS_WEB     = { true, true, false };
+static const StatusSet SS_GATEWAY = { true, true, true  };
+
+struct ComponentDef {
+    const char*   key;
+    Kind          kind;
+    const wchar_t* rel_dir;
+    const wchar_t* present_marker;
+    const wchar_t* default_svc;
+    unsigned short default_port;
+    const wchar_t* default_pathname;
+    StatusSet     l2_ok;
+    unsigned      start_timeout_secs;
+};
+
+// 顺序即修复顺序: 网关先于 web/portal。
+static const ComponentDef COMPONENTS[3] = {
+    { "artemis", Kind::Prunsrv, L"bin\\artemis", L"bin\\windows\\artemis.exe",
+      L"artemis", 9016, L"/artemis", SS_GATEWAY, 90 },
+    { "artemis-web", Kind::Node, L"bin\\artemis-web\\artemis-web", L"koa-app.js",
+      L"artemis-web", 9017, L"/artemis-web", SS_WEB, 60 },
+    { "artemis-portal", Kind::Node, L"bin\\artemis-portal\\artemis-portal", L"koa-app.js",
+      L"artemis-portal", 9018, L"/artemis-portal", SS_WEB, 60 },
+};
+
+struct ResolvedComponent {
+    const ComponentDef* def;
+    fs::path              dir;
+    std::wstring          svc_name;
+    unsigned short        port;
+    std::wstring          pathname;
+    bool                  present;
+    std::vector<std::string> warnings;
+};
+
+static std::string read_file_narrow(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return std::string();
+    return std::string((std::istreambuf_iterator<char>(f)),
+                       std::istreambuf_iterator<char>());
+}
+
+// 把 "set KEY=VALUE" 归一成 properties 行后复用 parse_properties。
+// 循环内不得早退, 首个不匹配行必须继续扫描。
+static bool parse_server_name_from_bat(const std::string& text, std::string& out) {
+    std::string props;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t nl = text.find('\n', pos);
+        std::string raw = (nl == std::string::npos) ? text.substr(pos)
+                                                    : text.substr(pos, nl - pos);
+        pos = (nl == std::string::npos) ? text.size() + 1 : nl + 1;
+        if (!raw.empty() && raw.back() == '\r') raw.pop_back();
+        size_t b = raw.find_first_not_of(" \t");
+        if (b == std::string::npos) continue;
+        std::string t = raw.substr(b);
+        if (t.compare(0, 4, "set ") != 0) continue;
+        props += t.substr(4);
+        props += '\n';
+    }
+    std::map<std::string, std::string> m = parse_properties(props);
+    std::map<std::string, std::string>::iterator it = m.find("_ServerName");
+    if (it == m.end()) return false;
+    std::string v = it->second;
+    while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
+    // 等价于 Rust 的 trim_matches('"'): 两端引号成对或单个都要去掉
+    while (v.size() >= 2 && v.front() == '"' && v.back() == '"')
+        v = v.substr(1, v.size() - 2);
+    if (v.empty()) return false;
+    out = v;
+    return true;
+}
+
+static std::map<std::string, std::string> props_for(const ComponentDef& def,
+                                                    const fs::path& dir) {
+    const wchar_t* name = (def.kind == Kind::Node) ? L"config.properties"
+                                                   : L"application.properties";
+    return parse_properties(read_file_narrow(dir / name));
+}
+
+// 读配置得到 svc/port/pathname; 任一失败则用兜底值并记 Warn (spec §5)。
+static ResolvedComponent resolve_component(const ComponentDef& def, const fs::path& root) {
+    ResolvedComponent c;
+    c.def = &def;
+    c.dir = root / def.rel_dir;
+    std::map<std::string, std::string> p = props_for(def, c.dir);
+
+    if (def.kind == Kind::Prunsrv) {
+        std::string bat = read_file_narrow(c.dir / L"bin" / L"__service.bat");
+        std::string nm;
+        if (!bat.empty() && parse_server_name_from_bat(bat, nm)) {
+            c.svc_name = ascii_value_to_wide(nm);
+        } else {
+            c.warnings.push_back(std::string("未读到 _ServerName, 用兜底服务名 ") + def.key);
+            c.svc_name = def.default_svc;
+        }
+    } else {
+        std::map<std::string, std::string>::iterator it = p.find("service.name");
+        if (it != p.end() && !it->second.empty()) {
+            c.svc_name = ascii_value_to_wide(it->second);
+        } else {
+            c.warnings.push_back(std::string("未读到 service.name, 用兜底服务名 ") + def.key);
+            c.svc_name = def.default_svc;
+        }
+    }
+
+    std::map<std::string, std::string>::iterator pit = p.find("server.port");
+    bool port_ok = false;
+    c.port = def.default_port;
+    if (pit != p.end()) {
+        const std::string& s = pit->second;
+        port_ok = !s.empty();
+        for (char ch : s) if (ch < '0' || ch > '9') { port_ok = false; break; }
+        if (port_ok) {
+            unsigned long pv = std::strtoul(s.c_str(), nullptr, 10);
+            port_ok = (pv > 0 && pv <= 65535);
+            if (port_ok) c.port = (unsigned short)pv;
+        }
+    }
+    if (!port_ok) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "未读到 server.port, 用兜底端口 %u", def.default_port);
+        c.warnings.push_back(buf);
+    }
+
+    const char* key = (def.kind == Kind::Prunsrv) ? "server.context-path" : "server.pathname";
+    std::map<std::string, std::string>::iterator tit = p.find(key);
+    if (tit != p.end() && !tit->second.empty()) {
+        std::string path = tit->second;
+        while (path.size() > 1 && path.back() == '/') path.pop_back();  // 等价 trim_end_matches('/')
+        c.pathname = ascii_value_to_wide(path);
+    } else {
+        c.pathname = def.default_pathname;
+        c.warnings.push_back(std::string("未读到 ") + key + ", 用兜底路径 "
+                             + ws2utf8(std::wstring(def.default_pathname)));
+    }
+
+    std::error_code ec;
+    c.present = fs::is_regular_file(c.dir / def.present_marker, ec);
+    return c;
+}
+
+// ----------------------------------------------------------------------------
 // 修复流程
 // ----------------------------------------------------------------------------
 static void print_wrapper_tail(const fs::path& comp_dir,
