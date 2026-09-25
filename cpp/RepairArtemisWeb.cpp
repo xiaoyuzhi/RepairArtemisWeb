@@ -1318,6 +1318,18 @@ static bool resolve_route_port(const NginxInfo& info, const std::string& path,
     return false;
 }
 
+// 显式 --nginx-root 必须真的指向含 conf/nginx.conf 的 nginx 根目录。
+// 传成外层目录时整份静态归因静默变成 "0 条 location", 看上去像配置里没有 artemis 路由。
+// 与 Rust main::nginx_root_arg_error 逐字一致。
+static bool nginx_root_arg_error(const fs::path& root, std::string& msg) {
+    std::error_code ec;
+    if (fs::is_regular_file(root / L"conf" / L"nginx.conf", ec)) return false;
+    msg = "--nginx-root 下未找到 conf/nginx.conf, 该参数须指向含 conf/ 的 nginx 根目录";
+    if (fs::is_regular_file(root / L"nginx" / L"conf" / L"nginx.conf", ec))
+        msg += "; 其下的 nginx/ 才是 nginx 根目录, 请改传该子目录";
+    return true;
+}
+
 // 在 base 下查找含 conf/nginx.conf 的目录, 写入 out (nginx 根)。
 static bool locate_nginx_conf(const fs::path& base, fs::path& out) {
     std::vector<fs::path> stack;
@@ -1775,6 +1787,15 @@ static int run_flow(const Options& opts) {
     bool check_only = opts.check_only;
     bool reinstall = opts.reinstall;
 
+    // == 0. 显式 --nginx-root 先校验: 参数错误要在做任何探测之前报出来 ==
+    if (!opts.nginx_root.empty()) {
+        std::string msg;
+        if (nginx_root_arg_error(fs::path(opts.nginx_root), msg)) {
+            logf(Level::Err, "%s", msg.c_str());
+            return 2;
+        }
+    }
+
     // == 1. 定位安装目录 ==
     fs::path root = opts.root.empty() ? fs::path(DEFAULT_OPENAPI_ROOT)
                                       : fs::path(opts.root);
@@ -2004,7 +2025,7 @@ static void usage() {
     std::printf("      --root <目录>       指定 OpenAPI 根目录\n");
     std::printf("                          默认: ");
     std::printf("%ls\n", DEFAULT_OPENAPI_ROOT);
-    std::printf("      --nginx-root <目录> 指定 nginx 根目录 (覆盖自动定位)\n");
+    std::printf("      --nginx-root <目录> 指定 nginx 根目录, 须含 conf/nginx.conf (覆盖自动定位)\n");
     std::printf("      --no-e2e            跳过 L3 端到端验收 (无 nginx / 离线环境)\n");
     std::printf("      --e2e-host <主机>   L3 目标主机, 默认 127.0.0.1\n");
     std::printf("      --yes               跳过网关重装的交互确认\n");

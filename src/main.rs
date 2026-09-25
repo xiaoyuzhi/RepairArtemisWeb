@@ -797,10 +797,33 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
 /// parse_args 用它表示"该打印帮助", 避免拿错误码字符串做判断。
 const HELP: &str = "\u{0}HELP";
 
+/// 显式 --nginx-root 必须真的指向含 conf/nginx.conf 的 nginx 根目录。
+/// 传成外层目录时整份静态归因静默变成 "0 条 location", 看上去像配置里没有 artemis 路由。
+/// 返回 Some(消息) = 该参数指错了地方。
+fn nginx_root_arg_error(root: &Path) -> Option<String> {
+    if root.join("conf").join("nginx.conf").is_file() {
+        return None;
+    }
+    let mut msg =
+        String::from("--nginx-root 下未找到 conf/nginx.conf, 该参数须指向含 conf/ 的 nginx 根目录");
+    if root.join("nginx").join("conf").join("nginx.conf").is_file() {
+        msg.push_str("; 其下的 nginx/ 才是 nginx 根目录, 请改传该子目录");
+    }
+    Some(msg)
+}
+
 fn run_flow(opts: &Options) -> i32 {
     let mut issues: u32 = 0;
     // 每条路由/每个组件对退出码的贡献, 最后由 overall_exit 汇总
     let mut contribs: Vec<u8> = Vec::new();
+
+    // == 0. 显式 --nginx-root 先校验: 参数错误要在做任何探测之前报出来 ==
+    if let Some(s) = &opts.nginx_root {
+        if let Some(msg) = nginx_root_arg_error(&PathBuf::from(s)) {
+            log(Level::Err, &msg);
+            return 2;
+        }
+    }
 
     // == 1. 定位安装目录 ==
     let mut root = PathBuf::from(opts.root.clone().unwrap_or_else(|| {
@@ -1060,7 +1083,7 @@ fn usage() {
     println!("      --components <a,b>  只处理指定组件, 默认 artemis,artemis-web,artemis-portal");
     println!("      --root <目录>       指定 OpenAPI 根目录");
     println!("                          默认: {}", DEFAULT_OPENAPI_ROOT);
-    println!("      --nginx-root <目录> 指定 nginx 根目录 (覆盖自动定位)");
+    println!("      --nginx-root <目录> 指定 nginx 根目录, 须含 conf/nginx.conf (覆盖自动定位)");
     println!("      --no-e2e            跳过 L3 端到端验收 (无 nginx / 离线环境)");
     println!("      --e2e-host <主机>   L3 目标主机, 默认 127.0.0.1");
     println!("      --yes               跳过网关重装的交互确认");
@@ -1298,7 +1321,8 @@ mod tests {
     }
 
     #[test]
-    fn 报告表把不一致行显式标出() {        use model::{L1, L2, L3};
+    fn 报告表把不一致行显式标出() {
+        use model::{L1, L2, L3};
         let t = render_route_table(&[
             RouteRow {
                 path: "/artemis-web".into(),
@@ -1320,5 +1344,26 @@ mod tests {
         assert!(t.contains("后端健康") || t.contains("nginx"), "必须给结论: {}", t);
         assert!(t.contains("未监听"), "{}", t);
         assert!(t.contains("9017"), "必须显示目标端口: {}", t);
+    }
+
+    #[test]
+    fn 显式nginx根缺conf布局时报参数错误并提示正确子目录() {
+        let dir = std::env::temp_dir().join(format!("bad_nginx_root_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // 空目录: 既没有 conf/nginx.conf 也没有 nginx/ 子目录
+        assert!(nginx_root_arg_error(&dir).is_some());
+
+        // 指错了外层 (真实布局是 <nginx>/conf/nginx.conf, 外层下还有个 nginx/ 子目录)
+        let real = dir.join("nginx").join("conf");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("nginx.conf"), "http {}").unwrap();
+        let m = nginx_root_arg_error(&dir).unwrap();
+        assert!(m.contains("conf/nginx.conf"), "消息须点名缺的那个文件: {}", m);
+        assert!(m.contains("nginx/"), "应提示改传 nginx/ 子目录: {}", m);
+
+        // 指向正确的 nginx 根 -> 通过
+        assert!(nginx_root_arg_error(&dir.join("nginx")).is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -106,7 +106,7 @@ RepairArtemisWeb.exe [选项]
   -r, --reinstall         允许卸载并重装服务 (含 Java 网关)
       --components <a,b>  只处理指定组件, 默认 artemis,artemis-web,artemis-portal
       --root <目录>       指定 OpenAPI 根目录 (默认标准安装路径自动定位)
-      --nginx-root <目录> 指定 nginx 根目录 (覆盖自动定位)
+      --nginx-root <目录> 指定 nginx 根目录, 须含 conf/nginx.conf (覆盖自动定位)
       --no-e2e            跳过 L3 端到端验收 (无 nginx / 离线环境)
       --e2e-host <主机>   L3 目标主机, 默认 127.0.0.1
       --yes               跳过网关重装的交互确认
@@ -119,7 +119,7 @@ RepairArtemisWeb.exe [选项]
 | --- | --- |
 | `0` | 无异常 |
 | `1` | 存在异常或修复失败 |
-| `2` | 命令行参数错误 / 权限不足 |
+| `2` | 命令行参数错误（含 `--nginx-root` 指向的目录下没有 `conf/nginx.conf`）/ 权限不足 |
 | `3` | **后端健康但 nginx 转发层故障** —— 别动后端，去查 nginx 配置 |
 
 ### 出问题时先跑这一条
