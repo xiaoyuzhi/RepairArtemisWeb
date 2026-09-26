@@ -5,6 +5,8 @@
 cpp/*.exe
 cpp/*.o
 cpp/*.obj
+# windres 由 assets/app.rc 生成, 每次构建重编
+assets/*.res
 
 # ---- 发布用二进制 (保留源码即可) ----
 *.exe

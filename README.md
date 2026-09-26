@@ -140,8 +140,12 @@ RepairArtemisWeb.exe --check-only
 │   ├── probe.rs             # L1 端口 / L2 直连 HTTP / L3 经 nginx 端到端
 │   ├── nginx.rs             # nginx 配置只读解析与回环归因
 │   └── logs.rs              # 日志尾部反向读取与故障特征归因
+├── assets/
+│   ├── app.ico              # 程序图标 (16/32/48/64/128/256 六档)
+│   └── app.rc               # 图标 + VERSIONINFO 版本资源, 两版共用
 ├── tests/fixtures/          # 单元用例用的假 root 与 nginx 配置
 ├── Cargo.toml               # Rust 工程 (零第三方依赖)
+├── build.rs                 # 调 rc.exe 编 assets/app.rc, 把资源链进 exe
 ├── .cargo/config.toml       # 静态链接 MSVC CRT, 单文件免运行库
 ├── cpp/
 │   ├── RepairArtemisWeb.cpp # C++ 版全部源码
@@ -156,6 +160,8 @@ Rust 版有 `cargo test` 覆盖纯逻辑（归因矩阵、配置解析、nginx �
 
 ### Rust 版
 
+前置：Rust 工具链（MSVC 目标）+ Windows 10/11 SDK（`build.rs` 要用其中的 `rc.exe` 编图标与版本资源；找不到时设环境变量 `RC` 指向 `rc.exe`）。
+
 ```powershell
 cargo build --release
 # 产物: target\release\RepairArtemisWeb.exe  (单文件, 免 VC 运行库)
@@ -164,7 +170,7 @@ cargo test --bin RepairArtemisWeb     # 跑纯逻辑单元测试
 
 ### C++ 版
 
-前置：安装 [MSYS2](https://www.msys2.org/) 的 `mingw-w64-x86_64-gcc`。
+前置：安装 [MSYS2](https://www.msys2.org/) 的 `mingw-w64-x86_64-gcc`（含 `windres`，用于同一份 `assets/app.rc`）。
 
 ```bat
 rem 双击或在命令行执行
@@ -173,6 +179,7 @@ rem 产物: cpp\RepairArtemisWeb.exe  (单文件, 免运行库)
 ```
 
 > 两个版本功能完全一致，可任选其一部署；仓库内不包含编译产物。
+> 图标与版本号由 `assets/app.rc` 单点定义，两版共用；`Cargo.toml` 与该文件里的版本号由单元测试钉住不分叉。
 
 ## 双版本一致性验证
 
@@ -186,6 +193,19 @@ fc out-rs.txt out-cpp.txt
 
 每行开头的 `[HH:MM:SS]` 时间戳必然不同，比对时忽略该前缀；其余文本须逐行一致。
 差异若不能归因到时间戳，即为两版行为分歧，按缺陷处理。
+
+比对必须覆盖到**第 7 步汇总**那一行才算数：只跑 `--check-only` 而本机没装平台时，两版都会在第 1 步"未找到 OpenAPI 目录"就退出，归因表、nginx 解析、退出码这些路径一条都没走到。没有已部署平台时，用一份合成的 OpenAPI 根目录补上覆盖——只需 `<root>\bin\artemis\application.properties`、`<root>\bin\artemis-web\artemis-web\config.properties`（portal 同理）与各组件的存在标记文件，再加同级的 `OpenAPI\nodejs\node-*\node.exe`，然后：
+
+```bat
+RepairArtemisWeb-rs.exe  --check-only --root <合成根> --nginx-root tests\fixtures\nginx-remote\nginx > out-rs.txt  2>&1
+RepairArtemisWeb-cpp.exe --check-only --root <合成根> --nginx-root tests\fixtures\nginx-remote\nginx > out-cpp.txt 2>&1
+```
+
+`--nginx-root` 要指到含 `conf\` 的那一层（夹具是 `tests\fixtures\nginx-remote\nginx`），传错外层目录会被判为参数错误、退出码 2。
+
+## 素材致谢
+
+程序图标（`assets/app.ico`，六档尺寸）取自 [ico5.net](https://www.ico5.net/) 提供的免费图标集，仅用于本工具的桌面/任务栏标识。
 
 ## 仓库镜像
 

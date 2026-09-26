@@ -1,0 +1,41 @@
+#pragma code_page(65001)
+
+// ============================================================================
+// 版本资源与图标 (Rust 版与 C++ 版共用本文件)
+//   版本号有三处出处: Cargo.toml、下面的字符串版、下面的数字版。
+//   main.rs 的测试 资源版本串必须跟清单版本一致 会钉住它们不分叉。
+//   编译: Rust 侧 build.rs 调 rc.exe, C++ 侧 build.bat 调 windres, 产物链接进 exe。
+//   图标: 小鸡图标来自 ico5.net 免费图标集 (ico5.net), 出处见 README。
+// ============================================================================
+
+1 ICON "app.ico"
+
+1 VERSIONINFO
+ FILEVERSION 0,2,0,0
+ PRODUCTVERSION 0,2,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0x0804 = 中文(简体, 中国), 0x04b0 = 1200 = UTF-16
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "余志强"
+            VALUE "FileDescription", "iSecure VMS OpenAPI artemis 组件修复与三层归因诊断工具"
+            VALUE "FileVersion", "0.2.0"
+            VALUE "InternalName", "RepairArtemisWeb"
+            VALUE "LegalCopyright", "Copyright (c) 2026 余志强 (Yu Zhiqiang). All rights reserved."
+            VALUE "OriginalFilename", "RepairArtemisWeb.exe"
+            VALUE "ProductName", "RepairArtemisWeb"
+            VALUE "ProductVersion", "0.2.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 0x4b0
+    END
+END

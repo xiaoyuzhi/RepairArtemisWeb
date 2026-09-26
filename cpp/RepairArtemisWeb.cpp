@@ -1887,7 +1887,7 @@ static int run_flow(const Options& opts) {
             ++issues;
         }
     } else {
-        log(Level::Warn, "未定位到 nginx, L3 端到端与 nginx 归因跳过。");
+        log(Level::Warn, "未定位到 nginx, 跳过 nginx 静态归因 (L3 端到端仍会实测)。");
     }
 
     // == 5. 组件修复 ==

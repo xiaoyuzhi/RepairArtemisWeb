@@ -1366,4 +1366,76 @@ mod tests {
         assert!(nginx_root_arg_error(&dir.join("nginx")).is_none());
         let _ = fs::remove_dir_all(&dir);
     }
+
+    fn asset(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("assets").join(name)
+    }
+
+    #[test]
+    fn 未定位nginx的文案两版必须逐字一致() {
+        // 双版本是手工镜像的, 现场按文案排查时两版说得不一样最要命。
+        // 这条曾经分叉过: C++ 说 "L3 端到端与 nginx 归因跳过", 而它其实照样跑了 L3。
+        const M: &str = "未定位到 nginx, 跳过 nginx 静态归因 (L3 端到端仍会实测)。";
+        assert!(include_str!("main.rs").contains(M), "Rust 版文案被改动");
+        assert!(
+            include_str!("../cpp/RepairArtemisWeb.cpp").contains(M),
+            "C++ 版该条文案与 Rust 版分叉了"
+        );
+    }
+
+    #[test]
+    fn 资源版本串必须跟清单版本一致() {
+        // 版本有三个出处: Cargo.toml、assets/app.rc 的字符串版与数字版。
+        // 任一处漏改, 现场就会拿到"属性面板 0.1.0 / 实际 0.2.0"的 exe。
+        let rc = fs::read_to_string(asset("app.rc")).expect("assets/app.rc 必须存在");
+        let v = env!("CARGO_PKG_VERSION");
+        assert!(
+            rc.contains(&format!("VALUE \"FileVersion\", \"{}\"", v)),
+            "FileVersion 字符串版应为 {}: 与 Cargo.toml 分叉了",
+            v
+        );
+        assert!(
+            rc.contains(&format!("VALUE \"ProductVersion\", \"{}\"", v)),
+            "ProductVersion 字符串版应为 {}",
+            v
+        );
+        let mut nums = v.split('.').collect::<Vec<_>>();
+        while nums.len() < 4 {
+            nums.push("0");
+        }
+        assert!(
+            rc.contains(&format!(" FILEVERSION {}", nums.join(","))),
+            "FILEVERSION 数字版应为 {} (与 Cargo.toml 分叉了)",
+            nums.join(",")
+        );
+        assert!(
+            rc.contains(&format!(" PRODUCTVERSION {}", nums.join(","))),
+            "PRODUCTVERSION 数字版应为 {}",
+            nums.join(",")
+        );
+    }
+
+    #[test]
+    fn 图标资源必须在册且含小尺寸档() {
+        // 任务栏/托盘按 16~32px 取图, 缺小档时 Windows 会把 256px 硬缩, 糊成一团
+        let ico = fs::read(asset("app.ico")).expect("assets/app.ico 必须存在");
+        assert!(ico.len() > 22, "ico 太小: {}", ico.len());
+        let (res, typ, count) = (
+            u16::from_le_bytes([ico[0], ico[1]]),
+            u16::from_le_bytes([ico[2], ico[3]]),
+            u16::from_le_bytes([ico[4], ico[5]]),
+        );
+        assert_eq!((res, typ), (0, 1), "必须是 ICONDIR/RT_GROUP_ICON 格式");
+        assert!(count >= 2, "至少要有大小两档, 实际 {} 档", count);
+        let px = |i: usize| -> u32 {
+            let w = ico[6 + 16 * i];
+            (if w == 0 { 256 } else { w as u32 })
+        };
+        let sizes: Vec<u32> = (0..count as usize).map(|i| px(i)).collect();
+        assert!(sizes.contains(&16) || sizes.contains(&32), "缺小尺寸档: {:?}", sizes);
+        assert!(sizes.contains(&256) || sizes.contains(&128), "缺大尺寸档: {:?}", sizes);
+        // app.rc 必须真的把它登记进资源
+        let rc = fs::read_to_string(asset("app.rc")).unwrap();
+        assert!(rc.contains("ICON \"app.ico\""), "app.rc 未引用 app.ico: {}", rc);
+    }
 }
